@@ -1,0 +1,80 @@
+---
+title: "Image_Analysis_POC"
+author: "Michael Burns"
+date: "2/12/2021"
+output: html_document
+---
+
+The purpose of this r markdown is to do some preliminary work on the pericarp retention project. I want to work with the EBImage package of bioconductor to ensure that it will work for my purposes.  My intent for this file is to extract RGB values from an image and and plot them.  My hope is that two distint groups will form, though I am doubtful.
+
+```{r load libraries}
+library(tidyverse)
+library(plotly)
+library(EBImage)
+library(raster)
+```
+
+```{r read image}
+image <- readImage("../Data/Images/POC/background_removed_highly_filtered.jpg")
+display(image, method = "raster")
+plot(image)
+```
+
+```{r dimensions of image}
+dim(image)
+```
+
+```{r converting to tibble}
+image %>% # This is slow! Plus, it puts all of the bands next to each other. Without careful coding, it will be very difficult to separate out the different bands.
+  as_tibble() %>%
+  dim()
+```
+
+```{r splitting channels}
+red_chan <- channel(image, mode = "red") %>% # extracting 
+  as_tibble() %>%
+  mutate(row = row_number()) %>%
+  pivot_longer(cols = -row, names_to = "column", values_to = "red", names_prefix = "V")
+
+green_chan <- channel(image, mode = "green") %>% # extracting 
+  as_tibble() %>%
+  mutate(row = row_number()) %>%
+  pivot_longer(cols = -row, names_to = "column", values_to = "green", names_prefix = "V")
+
+blue_chan <- channel(image, mode = "blue") %>% # extracting 
+  as_tibble() %>%
+  mutate(row = row_number()) %>%
+  pivot_longer(cols = -row, names_to = "column", values_to = "blue", names_prefix = "V")
+
+head(red_chan)
+head(green_chan)
+head(blue_chan)
+```
+
+```{r combining colorsets}
+full_color <- red_chan %>%
+  full_join(green_chan) %>%
+  full_join(blue_chan)
+
+head(full_color)
+```
+
+```{r filtered color}
+filt_color <- full_color %>%
+  filter(red > 0.2 & blue > 0.2 & green > 0.2)
+```
+
+
+```{r plotting color distributions}
+hist(filt_color$red)
+hist(filt_color$green)
+hist(filt_color$blue)
+
+plot_ly(x = filt_color$red,
+        y = filt_color$green,
+        z = filt_color$blue,
+        type = "scatter3d",
+        mode = "markers")
+```
+
+

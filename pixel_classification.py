@@ -9,20 +9,14 @@ Created on Wed Oct 27 11:59:31 2021
 ### Michael Burns
 ### 10/27/21
 
+#####################################################################################
+# Probably not going to be used in the long run, but worth keeping for example code #
+#####################################################################################
+
 # Purpose: To learn about creating predictive algorithms in python
 #          To predict the classes of a pixel based on training data
-#          To determin which model-parameter combo is best for my image data
+#          To determine which model-parameter combo is best for my image data
 
-# NOTE: It appears that pandas will be best for machine learning, so the first
-#       function needed is to extract a kernel, followed by the tabulation of
-#       its pixel values.  After this, the prediction can be done.  
-# NOTE: The above pipeline is fine for quantification, but it does little for 
-#       visualization.  I will need to find a way to collect pixel coordinates
-#       When I tabulate the data.
-# NOTE: After the model has been tested and validated, a final function that
-#       aggregates all of the functions needed in the pipeline can be created.
-#       Once this is done, all of the functions should be combined into one 
-#       script that can uploaded to github.
 
 ####################
 # Import Libraries #
@@ -30,27 +24,25 @@ Created on Wed Oct 27 11:59:31 2021
 import numpy as np
 import pandas as pd
 import image_kernel_detection
-import image_processing
+import time
+import glob
+from random import seed
 from skimage import io
-from skimage import color
 from skimage import filters
 from skimage import util
-from skimage import measure
-from skimage import morphology
+from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import learning_curve
+#from sklearn.metrics import classification_report
 from sklearn import naive_bayes # Base level model approach
 from sklearn import svm # Complex, accurate, slow approach
 from sklearn import neighbors # Clustering approach
 from sklearn import tree # Decision tree approach
 from sklearn import ensemble # Multimodel approach
-from sklearn import neural_network # Neural network approach
+from sklearn import linear_model # Neural network approach
+import xgboost as xgb
 import matplotlib.pyplot as plt
-import matplotlib as mpl
-
-########################
-# Plotting Adjustments #
-########################
-mpl.rcParams['figure.dpi'] = 300 # Increasing default figure resolution
 
 #################
 # Read in Image #
@@ -70,141 +62,471 @@ image_blur = util.img_as_ubyte(filters.gaussian(image_rgb,
 ###########################
 valid_image = image_kernel_detection.image_background_removal(image_blur)
 
-#plt.imshow(valid_image)
-#plt.axis('off')
-#plt.show()
-
-#valid_data = image_processing.tabulate_pixels(valid_image)
-
 #########################
 # Read in Training Data #
 #########################
 pixel_data = pd.read_table('../Data/White_Corn_Tabulated_Training_Data.txt',
                            delimiter = '\t')
 
-print(pixel_data)
+###############################################
+# Remove Background Pixels from Training Data #
+###############################################
+RM_BKG_PIX = True
 
-##############################
-# Reformatting Training Data #
-##############################
-pixel_data_melt = pixel_data.melt(value_vars = ['Pericarp', 
-                                                'Aleurone', 
-                                                'Background'],
-                                  var_name = 'Label', 
-                                  value_name = 'RGB')
-print(pixel_data_melt)
+if RM_BKG_PIX is True:
+    pixel_data = pixel_data[pixel_data.Label != 'Background']
 
-pixel_data_melt[['Red','Green','Blue']] = pixel_data_melt['RGB'].str.split(',', 
-                                                                           expand = True)
-
-pixel_data_melt = pixel_data_melt.iloc[:,[0,2,3,4]]
-
-pixel_data_melt = pixel_data_melt.astype({'Label' : 'category',
-                        'Red' : 'int32',
-                        'Green' : 'int32',
-                        'Blue' : 'int32'})
-
-print(pixel_data_melt)
-
-##############################################
-# Function to Calculate HSV from RGB Columns #
-##############################################
-def hsv_from_rgb_cols(dataset, red_name = 'Red', green_name = 'Green', blue_name = 'Blue'):
-    dataset['red_prime'] = dataset[red_name] / 255
-    dataset['green_prime'] = dataset[green_name] / 255
-    dataset['blue_prime'] = dataset[blue_name] / 255
-    dataset['Cmax'] = dataset[['red_prime', 'green_prime', 'blue_prime']].max(axis = 1)
-    dataset['Cmin'] = dataset[['red_prime', 'green_prime', 'blue_prime']].min(axis = 1)
-    dataset['range'] = dataset['Cmax'] - dataset['Cmin']
-    dataset.loc[dataset['Cmax'] == dataset['red_prime'], 'Hue'] = 60 * (((dataset['green_prime'] - dataset['blue_prime']) / dataset['range']) % 6)
-    dataset.loc[dataset['Cmax'] == dataset['green_prime'], 'Hue'] = 60 * (((dataset['blue_prime'] - dataset['red_prime']) / dataset['range']) + 2)
-    dataset.loc[dataset['Cmax'] == dataset['blue_prime'], 'Hue'] = 60 * (((dataset['red_prime'] - dataset['green_prime']) / dataset['range']) + 4)
-    dataset.loc[np.logical_and(dataset['Cmax'] == 0, dataset['range'] == 0), 'Hue'] = 0
-    dataset.loc[dataset['Cmax'] == 0, 'Saturation'] = 0
-    dataset.loc[dataset['Cmax'] != 0, 'Saturation'] = dataset['range'] / dataset['Cmax']
-    dataset['Value'] = dataset['Cmax']
-    
-    return_dataset = dataset.iloc[:, [0, 1, 2, 3, 10, 11, 12]]
-    return return_dataset
-
-full_pixel_data = hsv_from_rgb_cols(pixel_data_melt)
-
-full_pixel_data.loc['SV_Ratio'] = full_pixel_data['Saturation'] / full_pixel_data ['Value']
+###########################
+# Encoding Labels as Ints #
+###########################
+le = LabelEncoder()
+pixel_data.loc[:, 'Label_Codes'] = le.fit_transform(pixel_data['Label'])
 
 ###########################
 # Splitting Training Data #
 ###########################
-train, test = train_test_split(full_pixel_data,
-                               test_size = 0.2, 
+train, test = train_test_split(pixel_data,
+                               test_size = 0.8, 
                                random_state = 7)
 
-print(train)
-print(test)
+#####################################
+# Plotting Training Set Information #
+#####################################
+##############################################################
+# Plot Distributions of Each Channel for Each Classification #
+##############################################################
+def training_data_distributions(train_data,
+                                channel_names = ('Red', 'Green', 'Blue',
+                                                 'Hue', 'Saturation', 'Value',
+                                                 'Luminosity', 'A_Axis', 'B_Axis'),
+                                alpha = 0.7):
+    n_row = int(len(channel_names) / 3)
+    plot_num = 1
 
-# NOTE: Need to plot out the training set to see what it looks like before training a model
+    for channel in channel_names:
+        plt.subplot(n_row,3,plot_num)
+        plt.hist(train_data[channel][train_data.Label_Codes == 2],
+                 color = 'black',
+                 alpha = alpha,
+                 bins = 50)
+        plt.hist(train_data[channel][train_data.Label_Codes == 1],
+                 color = 'blue',
+                 alpha = alpha,
+                 bins = 50)
+        plt.hist(train_data[channel][train_data.Label_Codes == 0],
+                 color = 'yellow',
+                 alpha = alpha,
+                 bins = 50)
+        plt.title(channel + ' Distribution')
 
-colors = {'Pericarp':'blue', 'Aleurone':'red', 'Background':'black'}
+        plot_num += 1
+    
+    plt.tight_layout()
+    plt.show()
 
-plt.subplot(2,3,1)
-plt.scatter(train['Red'], train['Green'], c = train['Label'].map(colors))
-plt.xlabel('Red')
-plt.ylabel('Green')
-plt.subplot(2,3,2)
-plt.scatter(train['Green'], train['Blue'], c = train['Label'].map(colors))
-plt.xlabel('Green')
-plt.ylabel('Blue')
-plt.subplot(2,3,3)
-plt.scatter(train['Blue'], train['Red'], c = train['Label'].map(colors))
-plt.xlabel('Blue')
-plt.ylabel('Red')
-plt.subplot(2,3,4)
-plt.scatter(train['Hue'], train['Saturation'], c = train['Label'].map(colors))
-plt.xlabel('Hue')
-plt.ylabel('Saturation')
-plt.subplot(2,3,5)
-plt.scatter(train['Saturation'], train['Value'], c = train['Label'].map(colors))
-plt.xlabel('Saturation')
-plt.ylabel('Value')
-plt.subplot(2,3,6)
-plt.scatter(train['Value'], train['Hue'], c = train['Label'].map(colors))
-plt.xlabel('Value')
-plt.ylabel('Hue')
-plt.tight_layout()
-plt.show()
+training_data_distributions(train)
 
-######################################
-# Threshold for Pixel Classification #
-######################################
-# Based on the plots above, it looks like only the Red parameter is a good one
-# for single paramter thresholding.  HSV parameters better separate the data,
-# but it looks like they need an interation term to separate on.
-test.loc[test['Red'] > 100, 'thresh_red_pred'] = 'Aleurone'
-test.loc[test['Red'] < 100, 'thresh_red_pred'] = 'Pericarp'
-test.loc[test['Red'] == 0, 'thresh_red_pred'] = 'Background'
+#####################################################
+# Plot Combinations of Each Channel for Color Space #
+#####################################################
+def training_data_combinations(train_data,
+                               channel_names = [('Red', 'Green', 'Blue'),
+                                                ('Hue', 'Saturation', 'Value'),
+                                                ('Luminosity', 'A_Axis', 'B_Axis')],
+                               colors = {'Aleurone' : 'yellow',
+                                         'Pericarp' : 'blue',
+                                         'Light_Pericarp' : 'green',
+                                         'Dark_Pericarp' : 'black',
+                                         'Background' : 'purple'},
+                               alpha = 0.2):
+    n_row = int(len(channel_names))
+    plot_num = 1
 
-print(test)
+    for channel_group in channel_names:
+        channel_num_1 = 0
+        channel_num_2 = 1
+        
+        for channel in channel_group:
+            plt.subplot(n_row,3,plot_num)
+            plt.scatter(train_data[channel_group[channel_num_1]], 
+                        train_data[channel_group[channel_num_2]],
+                        c = train_data.Label.map(colors),
+                        alpha = alpha,
+                        marker = '.')
+            plt.xlabel(channel_group[channel_num_1])
+            plt.ylabel(channel_group[channel_num_2])
+            
+            plot_num += 1
+            channel_num_1 += 1
+            channel_num_2 += 1
+            
+            if(channel_num_1 == 2):
+                channel_num_2 = 0
 
-print(sum(test['Label'] == test['thresh_red_pred']))
+    plt.tight_layout()
+    plt.show()
+    
+training_data_combinations(train)
 
-# According to these results, thresholding by red value is the best way to proceed
-# I am skeptical though that this may be due to the way the data was collected,
-# And aI also doubt this will hold true for yellow corn.
+#################################################
+# Plot Heatmap of Correlations Between Features #
+#################################################
+def training_data_correlations(train_data, show_num = False):
+    plt.imshow(train_data.corr() ** 2, cmap = 'hot', interpolation = 'nearest')
+    plt.xticks(ticks = range(0,10),
+               labels = train_data.columns.values.tolist()[1:],
+               rotation = -45,
+               ha = 'left',
+               rotation_mode = 'anchor')
+    plt.yticks(ticks = range(0,10),
+               labels = train_data.columns.values.tolist()[1:])
+    plt.colorbar()
+    plt.title('PVE Between Features and Label')
+    plt.show()
+    
+    if show_num is True:
+        print('Training Data PVE:\n', train_data.corr() ** 2)
+    
+training_data_correlations(train, show_num = True)
 
-valid_copy = valid_image.copy()
-valid_copy[valid_image[:,:,0] > 110] = [255,255,255]
+#########################################
+# Initial Testing of Model Performances #
+#########################################
+def train_many_models(train_data, 
+                     models_list = [('NB', 
+                                     naive_bayes.GaussianNB(), 
+                                     {}),
+                                    ('KNN', 
+                                     neighbors.KNeighborsClassifier(), 
+                                     {'n_neighbors' : (3, 5, 7, 9),
+                                      'weights' : ('uniform',
+                                                   'distance')}),
+                                    ('DT',
+                                     tree.DecisionTreeClassifier(),
+                                     {'criterion' : ('gini',
+                                                     'entropy')}),
+                                    #('LOGIT',
+                                    # linear_model.LogisticRegression(),
+                                    # {'penalty' : ('l1',
+                                    #               'l2'),
+                                    #  'C' : (1, 10, 50, 100),
+                                    #  'fit_intercept' : (True,
+                                    #                     False)}),
+                                    ('SVC',
+                                     svm.SVC(),
+                                     {'C' : (1, 10, 50, 100, 500, 1000),
+                                      'kernel' : ('linear',
+                                                  'rbf',
+                                                  'sigmoid')}),
+                                    ('RF',
+                                     ensemble.RandomForestClassifier(),
+                                     {'criterion' : ('gini',
+                                                     'entropy'),
+                                                                               'n_estimators' : (3, 25, 50, 75, 100)}),
+                                    ('XGB',
+                                     xgb.XGBClassifier(eval_metric = 'mlogloss',
+                                                              use_label_encoder = False),
+                                     {'learning_rate' : (0.1, 0.3, 0.5, 0.7, 0.9),
+                                      'booster' : ('gbtree',
+                                                   'gblinear',
+                                                   'dart')}),
+                                    ('RC',
+                                     linear_model.RidgeClassifier(),
+                                     {'alpha' : (0.5, 1, 1.5, 2, 3, 5),
+                                      'fit_intercept' : (True,
+                                                         False),
+                                      'normalize' : (True,
+                                                     False)})],
+                     features = ['Red', 'Green', 'Blue',
+                                'Hue', 'Saturation', 'Value',
+                                'Luminosity', 'A_Axis', 'B_Axis']):
 
-plt.subplot(1,2,1)
-plt.imshow(valid_image)
-plt.title('Image without\nBackground')
-plt.axis('off')
-plt.subplot(1,2,2)
-plt.imshow(valid_copy)
-plt.title('Image Aleurone\nRed Threshold')
-plt.axis('off')
-plt.tight_layout()
-plt.show()
+    ############################
+    # Separating Training Data #
+    ############################
+    train_x = train_data[features]
+    train_y = train_data['Label_Codes']
+    
+    #################
+    # Storage Lists #
+    #################
+    best_models = {}
 
-# Based on the above plot, it looks like red thresholding works really well,
-# at least for this image. I have doubts about how generalizable this can be,
-# but I think it shows that red can be an informative channel for white corn
-# ML algorithms.
+    for name, model, params in models_list:
+        seed(7)
+        start = time.time()
+        grid_cv = GridSearchCV(estimator = model,
+                               cv = 10,
+                               param_grid = params,
+                               scoring = 'accuracy')
+        grid_cv.fit(train_x,
+                    train_y)
+        end = time.time()
+
+        if grid_cv.best_estimator_ not in best_models:
+            best_models[grid_cv.best_estimator_] = {'Time' : end - start,
+                                                    'Avg_Accuracy' : grid_cv.cv_results_['mean_test_score'][grid_cv.best_index_],
+                                                    'Var_Accuracy' : grid_cv.cv_results_['std_test_score'][grid_cv.best_index_]}
+    
+    return best_models
+
+###################################
+# Learning Curves for Many Models #
+###################################
+def learning_curves(train_data,
+                    model,
+                    features = ['Red', 'Green', 'Blue',
+                               'Hue', 'Saturation', 'Value',
+                               'Luminosity', 'A_Axis', 'B_Axis'],
+                    train_sizes = np.linspace(0.005,1.0,20),
+                    n_cv = 10):
+    ############################
+    # Separating Training Data #
+    ############################
+    train_x = train_data[features]
+    train_y = train_data['Label_Codes']
+    
+    seed(7)
+    
+    train_sizes, train_scores, test_scores, fit_times, _ = learning_curve(model,
+                                                                          train_x,
+                                                                          train_y,
+                                                                          train_sizes = train_sizes,
+                                                                          cv = n_cv,
+                                                                          return_times = True)
+    
+    return train_sizes, train_scores, test_scores, fit_times
+
+def test_model_on_image(train_data,
+                        model,
+                        image,
+                        features = ['Red', 'Green', 'Blue',
+                                   'Hue', 'Saturation', 'Value',
+                                   'Luminosity', 'A_Axis', 'B_Axis'],
+                        give_image = True,
+                        give_coverage = True):
+    test_image = np.zeros(image.shape[0:2])
+
+    train_x = train_data[features]
+    train_y = train_data['Label_Codes']
+
+    model.fit(train_x,
+              train_y)
+    
+    results = []
+    
+    for kernel in range(1, image_kernel_detection.image_labelling(image).max() + 1):
+        test_tab = image_kernel_detection.indiv_kernel_data_extraction(image,
+                                                                  kernel_number = kernel)
+
+        preds = model.predict(test_tab[features])
+        
+        results.append(round((sum(le.inverse_transform(preds) == 'Aleurone') / test_tab.shape[0]) * 100, 2))
+        
+        x_data = np.array(test_tab.X).astype(int)
+        y_data = np.array(test_tab.Y).astype(int)
+        
+        test_image[y_data, x_data] = preds.transpose() + 1
+
+    if give_coverage is True and give_image is True:
+        return test_image, np.array(results)
+    elif give_coverage is True and give_image is False:
+        return np.array(results)
+    elif give_coverage is False and give_image is True:
+        return test_image
+    else:
+        print('No outputs were requested.\nPlease set give_image or give_coverage to True')
+
+####################################################################
+# Display Many Combinations of Training Sets, Features, and Images #
+####################################################################
+train_sets = sorted(glob.glob('../Data/White_Corn_Tabulated*Training_Data.txt'))
+print(train_sets)
+
+images = sorted(glob.glob('../Data/Images/Trials/Multi_Genotype_Images/*W*Grid*.tif'))
+print(images)
+
+features_list = [
+                 ['Red', 'Green', 'Blue',
+                  'Hue', 'Saturation', 'Value',
+                  'Luminosity', 'A_Axis', 'B_Axis'],
+                 ['Hue', 'Saturation', 'A_Axis', 'B_Axis'],
+                 #['Red', 'Green', 'Blue'],
+                 #['Hue', 'Saturation', 'Value'],
+                 #['Luminosity', 'A_Axis', 'B_Axis']
+                 ]
+
+models_list = [('NB', 
+                naive_bayes.GaussianNB(), 
+                {}),
+               ('KNN', 
+                neighbors.KNeighborsClassifier(), 
+                {'n_neighbors' : (3, 5, 7, 9),
+                 'weights' : ('uniform',
+                              'distance')}),
+               ('DT',
+                tree.DecisionTreeClassifier(),
+                {'criterion' : ('gini',
+                                'entropy')}),
+               #('LOGIT',
+               # linear_model.LogisticRegression(),
+               # {'penalty' : ('l1',
+               #               'l2'),
+               #  'C' : (1, 10, 50, 100),
+               #  'fit_intercept' : (True,
+               #                     False)}),
+               ('SVC',
+                svm.SVC(),
+                {'C' : (1, 10, 50, 100, 500, 1000),
+                 'kernel' : ('linear',
+                             'rbf',
+                             'sigmoid')}),
+               ('RF',
+                ensemble.RandomForestClassifier(),
+                {'criterion' : ('gini',
+                                'entropy'),
+                                                          'n_estimators' : (3, 25, 50, 75, 100)}),
+               ('XGB',
+                xgb.XGBClassifier(eval_metric = 'mlogloss',
+                                         use_label_encoder = False),
+                {'learning_rate' : (0.1, 0.3, 0.5, 0.7, 0.9),
+                 'booster' : ('gbtree',
+                              'gblinear',
+                              'dart')}),
+               ('RC',
+                linear_model.RidgeClassifier(),
+                {'alpha' : (0.5, 1, 1.5, 2, 3, 5),
+                 'fit_intercept' : (True,
+                                    False),
+                 'normalize' : (True,
+                                False)})]
+
+for model in models_list:
+    print(model)
+    plot_num = 1
+
+    plt.figure(figsize = (8,16), dpi = 300)
+
+    for image in images:
+        print(image)
+
+        input_image = io.imread(image, plugin = 'pil')
+
+        for features in features_list:
+            if(plot_num not in [1, 6, 11, 16, 21]):
+                print('Working on plot: ' + str(plot_num))
+    
+                plt.subplot(5,5,plot_num)
+                plt.imshow(input_image)
+                plt.axis('off')
+                if plot_num == 3:
+                    plt.title('Original')
+    
+                plot_num += 1
+
+            for train in train_sets:
+                print('Working on plot: ' + str(plot_num))
+                # Read in Training Data #
+                pixel_data = pd.read_table(train,
+                                           delimiter = '\t')
+
+                # Remove Background Pixels from Training Data #
+                pixel_data = pixel_data[pixel_data.Label != 'Background']
+
+                # Encoding Labels as Ints #
+                le = LabelEncoder()
+                pixel_data.loc[:, 'Label_Codes'] = le.fit_transform(pixel_data['Label'])
+
+                # Splitting Training Data #
+                train, test = train_test_split(pixel_data,
+                                               test_size = 0.8, 
+                                               random_state = 7)
+
+                current_model = GridSearchCV(estimator = model[1],
+                                             cv = 10,
+                                             param_grid = model[2],
+                                             scoring = 'accuracy')
+
+                current_model.fit(train[features],
+                                  train['Label_Codes'])
+
+                predicted_image = test_model_on_image(train,
+                                                      current_model,
+                                                      input_image,
+                                                      features = features,
+                                                      give_image = True,
+                                                      give_coverage = False)
+
+                plt.subplot(5,5,plot_num)
+                plt.imshow(predicted_image)
+                plt.axis('off')
+
+                if plot_num == 1 or plot_num == 2:
+                    plt.title('RGBHSVLAB')
+                if plot_num == 4 or plot_num == 5:
+                    plt.title('HSAB')
+
+                plot_num += 1
+    plt.suptitle(model[0], y = 0.92)
+    plt.savefig('junk_test.png')
+
+
+
+
+
+####################################################
+# Try the Best Model on Each of the Trial Pictures #
+####################################################
+VALIDATE_MODEL = False
+
+if VALIDATE_MODEL is True:
+    
+
+    chosen_model = svm.SVC(C = 1)
+
+    chosen_model.fit(train[['Red', 'Green', 'Blue',
+                            'Hue', 'Saturation', 'Value',
+                            'Luminosity', 'A_Axis', 'B_Axis']],
+                     train['Label_Codes'])
+
+    images = sorted(glob.glob('../Data/Images/Trials/Multi_Genotype_Images/*W*.tif'))
+    print(images)
+
+    for image in images:
+        input_image = io.imread(image, plugin = 'pil')
+        dummy_img = np.zeros(input_image.shape[0:2])
+
+        input_blur = util.img_as_ubyte(filters.gaussian(input_image,
+                                       sigma = 5,
+                                       multichannel = True,
+                                       truncate = 2))
+
+        for kernel in range(1,11):
+            data = image_kernel_detection.indiv_kernel_data_extraction(input_image, 
+                                                                  kernel_number = kernel)
+
+            preds = chosen_model.predict(data[['Red', 'Green', 'Blue',
+                                               'Hue', 'Saturation', 'Value',
+                                               'Luminosity', 'A_Axis', 'B_Axis']])
+
+            x_data = np.array(data['X']).astype(int)
+            y_data = np.array(data['Y']).astype(int)
+    
+            dummy_img[y_data, x_data] = preds.transpose() + 1 # Since predictions begin at 1, but not background is included, I add 1 to the predctions
+
+            print('Kernel ' +
+                  str(kernel) +
+                  ' is ' +
+                  str(round((sum(le.inverse_transform(preds) == 'Aleurone') / data.shape[0]) * 100, 2)) +
+                  '% aleurone')
+
+        plt.subplot(1,2,1)
+        plt.imshow(input_image)
+        plt.title('Original')
+        plt.axis('off')
+        plt.subplot(1,2,2)
+        plt.imshow(dummy_img)
+        plt.title('SVC (White Training)')
+        plt.axis('off')
+        plt.tight_layout()
+        plt.show()

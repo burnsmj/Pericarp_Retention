@@ -17,9 +17,9 @@ Created on Mon Oct 11 11:16:33 2021
 ###################
 # Import Packages #
 ###################
-import os
 import glob
 import numpy as np
+import pandas as pd
 from skimage import io
 from skimage import color
 from skimage import filters
@@ -29,11 +29,6 @@ from skimage import morphology
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 from scipy.signal import argrelmin
-
-#########################
-# Set Working Directory #
-#########################
-os.chdir('/Users/michael/Desktop/Grad_School/Research/Projects/Pericarp/Code')
 
 ########################
 # Plotting Adjustments #
@@ -94,7 +89,6 @@ def image_auto_threshold(hsv_image,
 
 def image_masking(image,
                   method = 'SV',
-                  threshold = 15,
                   closable_area = 1500):
     """
     Parameters
@@ -189,8 +183,8 @@ def image_masking(image,
         ###################################
         # Threshold Images (Create Masks) #
         ###################################
-        s_mask[image_hsv[:,:,1] < threshold] = [0]
-        s_mask[image_hsv[:,:,1] >= threshold] = [1]
+        s_mask[image_hsv[:,:,1] < image_auto_threshold(image_hsv)] = [0]
+        s_mask[image_hsv[:,:,1] >= image_auto_threshold(image_hsv)] = [1]
         
         #######################
         # Close Holes in Mask #
@@ -223,7 +217,6 @@ def image_masking(image,
 
 def image_background_removal(image,
                              method = 'SV',
-                             threshold = 15,
                              closable_area = 1500):
     """
     Parameters
@@ -277,7 +270,6 @@ def image_background_removal(image,
     ##################################
     mask = image_masking(image,
                          method = method,
-                         threshold = threshold,
                          closable_area = closable_area)
 
     ####################################
@@ -302,7 +294,6 @@ def image_background_removal(image,
 #####################
 def image_labelling(image,
                     method = 'SV',
-                    threshold = 15,
                     closable_area = 1500):
     """
     Parameters
@@ -357,7 +348,6 @@ def image_labelling(image,
     #######################
     mask_image = image_masking(image,
                                method = method,
-                               threshold = threshold,
                                closable_area = closable_area)
 
     #########################
@@ -376,16 +366,106 @@ def image_labelling(image,
     #########################
     return labelled_image
 
-###################
-# Write out Image #
-###################
-#io.imsave('../Data/Images/White_MB_H2O_No_Bkg.png',
-#          image_background_removal(image_blur))
+##########################################
+# Extract a given labelled kernel's data #
+##########################################
+def indiv_kernel_data_extraction(image, kernel_number = 1):
+    """
+    Parameters
+    ----------
+    image : NumPy array of a PNG photo
+        Should be an RGB photo, with a scale of 0-1 rather than 0-255.
+    kernel_number : An integer of the labelled kernel of interest
+        Should be between 1 and the total number of kernels.
+        Label 0 is the background
+
+    Returns
+    -------
+    kernel_data : an 8xN pandas dataframe (where N is the number of pixels)
+        containing the indecies of the pixel (in X and Y), the RGB, and HSV
+        values (each channel has its own channel).
+
+    Use
+    ---
+    indiv_kernel_extraction(<image_name>) : Returns a dataframe with RGB and HSV data
+        as well as pixel coordinates for one kernel.
+    for kernel in range(1,11):
+        indiv_kernel_extraction(<image_name>, kernel_number = kernel) : Returns
+            the data (Indecies, RGB, HSV) for kernels 1 through 10 in given image.
+
+    Required Packages
+    -----------------
+    numpy as np
+    color from skimage
+    filters from skimage
+    morphology from skimage
+    util from skimage
+    measure from skimage
+    pandas as pd
+    """
+    #######################################
+    # Create Labelled Image and HSV Image #
+    #######################################
+    labelled_image = image_labelling(image)
+    image_hsv = color.rgb2hsv(image)
+    image_lab = color.rgb2lab(image / 255) # rgb2lab expects data to be between 0 and 1
+
+    #################################################
+    # Create Flat Numpy Arrays of Indicies and Data #
+    #################################################
+    np_ind = np.fliplr(np.array(np.where(labelled_image == kernel_number)).transpose())
+    np_rgb = image[labelled_image == kernel_number]
+    np_hsv = image_hsv[labelled_image == kernel_number] # Make sure this is consistent with training set
+    np_lab = image_lab[labelled_image == kernel_number]
+
+    ###################################
+    # Stack Flat Numpy Arrays of Data #
+    ###################################
+    np_kernel = np.hstack((np_ind, np_rgb, np_hsv, np_lab))
+
+    #######################################
+    # Compiling Data in Pandas Data Frame #
+    #######################################
+    kernel_data = pd.DataFrame(np_kernel, columns = ['X', 'Y',
+                                                     'Red',
+                                                     'Green',
+                                                     'Blue',
+                                                     'Hue',
+                                                     'Saturation',
+                                                     'Value',
+                                                     'Luminosity',
+                                                     'A_Axis',
+                                                     'B_Axis'], index = None)
+
+    #########################
+    # Return Tabulated Data #
+    #########################
+    return kernel_data
+
+###################################
+# Write out Images of each Kernel #
+###################################
+def indiv_kernel_image_extraction(image,
+                                  padding = 10,
+                                  fname = 'test_file',
+                                  ftype = 'tif'):
+    labelled_image = image_labelling(image)
+    kernel_count = np.unique(labelled_image)
+    
+    for kernel in kernel_count[1:]:
+        coords = np.where(labelled_image == kernel)
+        
+        kernel_image = image_background_removal(image)[min(coords[0]) - padding : max(coords[0]) + padding,
+                                                     min(coords[1]) - padding : max(coords[1]) + padding,:]
+        
+        io.imsave(str(fname) + '_' + str(kernel) + '.' + str(ftype), kernel_image)
+        
+#indiv_kernel_image_extraction(image_rgb)
 
 ###############
 # Show Images #
 ###############
-SHOW_PLOTS = True
+SHOW_PLOTS = False
 
 if SHOW_PLOTS is True:
     print('Starting Plotting')

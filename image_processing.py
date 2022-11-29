@@ -113,7 +113,7 @@ def image_normalization (image):
 
 
 
-def plot_pixel_distribution (image):
+def plot_pixel_distribution (image, max_count = 100000):
     """
 
     Parameters
@@ -163,32 +163,32 @@ def plot_pixel_distribution (image):
     plt.subplot(2,3,1)
     plt.hist(red.ravel(), bins = 256)
     plt.title('Red')
-    plt.ylim(0,100000)
+    plt.ylim(0,max_count)
     plt.ticklabel_format(style = 'plain')
     plt.subplot(2,3,2)
     plt.hist(green.ravel(), bins = 256)
     plt.title('Green')
-    plt.ylim(0,100000)
+    plt.ylim(0,max_count)
     plt.ticklabel_format(style = 'plain')
     plt.subplot(2,3,3)
     plt.hist(blue.ravel(), bins = 256)
     plt.title('Blue')
-    plt.ylim(0,100000)
+    plt.ylim(0,max_count)
     plt.ticklabel_format(style = 'plain')
     plt.subplot(2,3,4)
     plt.hist(hue.ravel(), bins = 256)
     plt.title('Hue')
-    plt.ylim(0,100000)
+    plt.ylim(0,max_count)
     plt.ticklabel_format(style = 'plain')
     plt.subplot(2,3,5)
     plt.hist(sat.ravel(), bins = 256)
     plt.title('Saturation')
-    plt.ylim(0,100000)
+    plt.ylim(0,max_count)
     plt.ticklabel_format(style = 'plain')
     plt.subplot(2,3,6)
     plt.hist(val.ravel(), bins = 256)
     plt.title('Value')
-    plt.ylim(0,100000)
+    plt.ylim(0,max_count)
     plt.ticklabel_format(style = 'plain')
     plt.tight_layout()
     plt.show()
@@ -548,10 +548,46 @@ def plotting_differential_clusters (image, min_cluster = 2, max_cluster = 8):
     # Return Information #
     ######################
     print('Plotting Complete')
+    
+    
+def inidiv_cluster_plotting(image, clusters = 3):
+    img_pos = 1
+    
+    image_orig = image.copy()
+    
+    plt.subplot(1,clusters+1,1)
+    plt.imshow(image_orig)
+    plt.title('Original')
+    plt.axis('off')
 
+    img_pos += 1
 
+    cluster_data = pixel_clustering(image, clusters = clusters)
+    image_cp = image.copy()
 
+    for cluster in range(0, clusters):
+        image[cluster_data != cluster] = 0
 
+        plt.subplot(1,clusters+1,img_pos)
+        plt.imshow(image)
+        plt.axis('off')
+        plt.title('Cluster: ' + str(cluster))
+
+        img_pos += 1
+        
+        image = image_cp.copy()
+
+    plt.tight_layout()
+    plt.show()
+
+# NOT A VIABLE OPTION FOR ANNOTATION.  LEAVES TOO MANY PIXELS ON LIGHTLY COLORED PERICARP
+#images = sorted(glob.glob('*.tif'))
+#for image in images:
+#    print(image)
+#    test_image = io.imread(image, plugin = 'pil')
+#    
+#    for i in range(5,8):
+#        inidiv_cluster_plotting(test_image.copy(), clusters = i)
 
 
 

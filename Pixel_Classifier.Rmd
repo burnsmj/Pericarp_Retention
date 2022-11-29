@@ -1,0 +1,890 @@
+---
+title: "Pixel Class Prediction"
+author: "Michael Burns"
+date: "4/8/2021"
+output: html_document
+---
+
+# White Corn
+## Load Libraries
+```{r load libraries}
+library(tidyverse)
+library(EBImage)
+library(raster)
+library(caret)
+```
+
+Validate the below findings (through line ~185) on yellow corn data.  I suspect it will be less accurate.
+
+## Load the Training Data
+```{r load training data}
+full_dataset <- read_tsv("../Data/WCTTD.txt", col_types = "ccc") %>%
+  pivot_longer(cols = everything(), names_to = "Pixel_Type", values_to = "RGB") %>%
+  separate(col = RGB, into = c("Red", "Green", "Blue"), sep = ",") %>%
+  mutate(Pixel_Type = factor(Pixel_Type),
+         Red = as.numeric(Red),
+         Green = as.numeric(Green),
+         Blue = as.numeric(Blue))
+
+full_dataset
+```
+
+## Visualize the RGB Dataset
+```{r data visualization}
+full_dataset %>%
+  pivot_longer(cols = -Pixel_Type, names_to = "Color", values_to = "Intensity") %>%
+  mutate(Color = fct_relevel(Color, c("Red", "Green", "Blue"))) %>%
+  ggplot(aes(x = Intensity, fill = Pixel_Type))+
+  geom_histogram()+
+  scale_fill_manual(values = c("black", "yellow", "purple"))+
+  facet_wrap(~Color)+
+  labs(title =  "White Corn Color Distribution within Pixel Class",
+       fill = "Pixel Classificaiton")+
+  theme_classic()
+
+full_dataset %>%
+  pivot_longer(cols = -Pixel_Type, names_to = "Color", values_to = "Intensity") %>%
+  mutate(Color = fct_relevel(Color, c("Red", "Green", "Blue"))) %>%
+  ggplot(aes(x = Pixel_Type, y = Intensity, color = Color))+
+  geom_jitter()+
+  labs(title = "White Corn Color Differences within Pixel Class",
+       color = "Color",
+       x = "Pixel Classification")+
+  theme_classic()
+
+full_dataset %>%
+  ggplot(aes(x = Red, y = Green, color = Pixel_Type))+
+  geom_point()+
+  labs(title = "White Corn Color Correlation: Red and Green",
+       x = "Red Intensity",
+       y = "Green Intensity")+
+  theme_classic()
+full_dataset %>%
+  ggplot(aes(x = Red, y = Blue, color = Pixel_Type))+
+  geom_point()+
+  labs(title = "White Corn Color Correlation: Red and Blue",
+       x = "Red Intensity",
+       y = "Blue Intensity")+
+  theme_classic()
+full_dataset %>%
+  ggplot(aes(x = Green, y = Blue, color = Pixel_Type))+
+  geom_point()+
+  labs(title = "White Corn Color Correlation: Green and Blue",
+       x = "Green Intensity",
+       y = "Blue Intensity")+
+  theme_classic()
+
+pixel_pca <- prcomp(full_dataset[,-1], center = T, scale. = T)
+pixel_pca$x %>%
+  as_tibble() %>%
+  mutate(Pixel_Type = full_dataset$Pixel_Type) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Pixel_Type))+
+  geom_point()+
+  theme_classic()
+```
+
+## Look at Relationships in Data
+```{r look into relationships}
+full_dataset %>%
+  pivot_longer(cols = -Pixel_Type, names_to = "Color", values_to = "Intensity") %>%
+  group_by(Pixel_Type, Color) %>%
+  summarise(Mean_Intensity = mean(Intensity),
+            StDev_Intensity = sd(Intensity),
+            n = n()) %>%
+  group_by(Color) %>%
+  mutate(grand_mean = mean(Mean_Intensity)) %>%
+  mutate(ss_group = sum(n * (Mean_Intensity - grand_mean)^2),
+         df_group = 2,
+         ms_group = ss_group/df_group) %>%
+  mutate(ss_error = sum((n - 1) * StDev_Intensity^2),
+         df_error = 242,
+         ms_error = ss_error/df_error) %>%
+  summarise(f_val = ms_group/ms_error) %>%
+  ungroup() %>%
+  summarise(Color = unique(Color),
+            f_val = unique(f_val)) %>%
+  mutate(crit_f = qf(p = 0.05, df1 = 2, df2 = 242, lower.tail = F))
+
+bkg_rd <- full_dataset %>%
+  filter(Pixel_Type == "background") %>%
+  dplyr::select(Red)
+bkg_grn <- full_dataset %>%
+  filter(Pixel_Type == "background") %>%
+  dplyr::select(Green)
+bkg_bl <- full_dataset %>%
+  filter(Pixel_Type == "background") %>%
+  dplyr::select(Blue)
+
+endo_rd <- full_dataset %>%
+  filter(Pixel_Type == "endosperm") %>%
+  dplyr::select(Red)
+endo_grn <- full_dataset %>%
+  filter(Pixel_Type == "endosperm") %>%
+  dplyr::select(Green)
+endo_bl <- full_dataset %>%
+  filter(Pixel_Type == "endosperm") %>%
+  dplyr::select(Blue)
+
+peri_rd <- full_dataset %>%
+  filter(Pixel_Type == "pericarp") %>%
+  dplyr::select(Red)
+peri_grn <- full_dataset %>%
+  filter(Pixel_Type == "pericarp") %>%
+  dplyr::select(Green)
+peri_bl <- full_dataset %>%
+  filter(Pixel_Type == "pericarp") %>%
+  dplyr::select(Blue)
+
+groups_list <- list(bkg_rd, bkg_grn, bkg_bl, endo_rd, endo_grn, endo_bl, peri_rd, peri_grn, peri_bl)
+matrix_p <- matrix(nrow = 9, ncol = 9)
+colnames(matrix_p) <- c('bkg_rd', 'bkg_grn', 'bkg_bl', 'endo_rd', 'endo_grn', 'endo_bl', 'peri_rd', 'peri_grn', 'peri_bl')
+rownames(matrix_p) <- c('bkg_rd', 'bkg_grn', 'bkg_bl', 'endo_rd', 'endo_grn', 'endo_bl', 'peri_rd', 'peri_grn', 'peri_bl')
+for(i in 1:9){
+  for(n in 1:9){
+    p_val <- t.test(groups_list[[i]], groups_list[[n]])[3]
+    matrix_p[i,n] <- p_val[[1]]
+  }
+}
+
+matrix_p_rd <- matrix_p[c(1,4,7),c(1,4,7)]
+matrix_p_grn <- matrix_p[c(2,5,8),c(2,5,8)]
+matrix_p_bl <- matrix_p[c(3,6,9),c(3,6,9)]
+
+matrix_p_rd
+matrix_p_grn
+matrix_p_bl
+
+nearZeroVar(full_dataset)
+findLinearCombos(full_dataset[,-1])
+```
+
+## Splitting Data into Train and Test Sets
+```{r splitting dataset}
+training_index <- createDataPartition(full_dataset$Pixel_Type, p = 0.75, list = F)
+train_subset <- full_dataset[training_index,]
+test_subset <- full_dataset[-training_index,]
+```
+
+## Training Models
+```{r training models, message=F, warning=F}
+# Extreme Gradient Boosting
+set.seed(7)
+ptm_xgb <- proc.time()
+xgb_model <- train(Pixel_Type ~ .,
+                      data = train_subset,
+                      method = "xgbLinear",
+                      metric = "Accuracy",
+                      tuneGrid = expand.grid(nrounds = c(5), # This section doesn't seem to be important. nrounds = number of iterations (speed)
+                                             lambda = c(0.1), # L2 regularization. Affects weight of loss function (squared)
+                                             alpha = c(0.1), # L1 regualarization. Affects weight of loss function (absolute value)
+                                             eta = c(0.5)), # learning rate (0-1). Lower = more robust to overfitting but slower
+                      trControl = trainControl(method = "cv",
+                                               savePredictions = T, 
+                                               allowParallel = T
+                      )
+)
+time_xgb <- proc.time() - ptm_xgb
+
+# SVM Linear Model
+set.seed(7)
+ptm_svml <- proc.time()
+svml_model <- train(Pixel_Type ~ .,
+                      data = train_subset,
+                      method = "svmLinear",
+                      metric = "Accuracy",
+                      tuneGrid = expand.grid(C = c(1)),
+                      trControl = trainControl(method = "cv",
+                                               savePredictions = T, 
+                                               allowParallel = T
+                      )
+)
+time_svml <- proc.time() - ptm_svml
+
+# SVM Radial Model
+set.seed(7)
+ptm_svmr <- proc.time()
+svmr_model <- train(Pixel_Type ~ .,
+                      data = train_subset,
+                      method = "svmRadial",
+                      metric = "Accuracy",
+                      tuneGrid = expand.grid(C = c(10), sigma = c(10)),
+                      trControl = trainControl(method = "cv",
+                                               savePredictions = T, 
+                                               allowParallel = T
+                      )
+)
+time_svmr <- proc.time() - ptm_svmr
+
+# Random Forest Model
+set.seed(7)
+ptm_rf <- proc.time()
+rf_model <- train(Pixel_Type ~ .,
+                      data = train_subset,
+                      method = "rf",
+                      metric = "Accuracy",
+                      tuneGrid = expand.grid(mtry = c(2)), 
+                      trControl = trainControl(method = "cv",
+                                               savePredictions = T, 
+                                               allowParallel = T
+                      )
+)
+time_rf <- proc.time() - ptm_rf
+
+# Decision Tree Model
+set.seed(7)
+ptm_dt <- proc.time()
+dt_model <- train(Pixel_Type ~ .,
+                      data = train_subset,
+                      method = "rpart",
+                      metric = "Accuracy",
+                      tuneGrid = expand.grid(cp = c(0.25)),
+                      trControl = trainControl(method = "cv",
+                                               savePredictions = T, 
+                                               allowParallel = T
+                      )
+)
+time_dt <- proc.time() - ptm_dt
+
+# Naive Bayes Model
+set.seed(7)
+ptm_nb <- proc.time()
+nb_model <- train(Pixel_Type ~ .,
+                      data = train_subset,
+                      method = "nb",
+                      metric = "Accuracy",
+                      tuneGrid = expand.grid(usekernel = c(T), fL = c(0), adjust = c(1)),
+                      trControl = trainControl(method = "cv",
+                                               savePredictions = T, 
+                                               allowParallel = T
+                      )
+)
+time_nb <- proc.time() - ptm_nb
+
+# Linear Discriminant Analysis Model
+set.seed(7)
+ptm_lda <- proc.time()
+lda_model <- train(Pixel_Type ~ .,
+                      data = train_subset,
+                      method = "lda",
+                      metric = "Accuracy",
+                      trControl = trainControl(method = "cv",
+                                               savePredictions = T, 
+                                               allowParallel = T
+                      )
+)
+time_lda <- proc.time() - ptm_lda
+
+# Collecting Results from models
+results <- resamples(list(XGB=xgb_model, SVML=svml_model, SVMR = svmr_model, RF=rf_model, DT=dt_model, NB=nb_model, LDA=lda_model))
+# Summarize the distributions
+summary(results)
+# Boxplots of results
+bwplot(results)
+# Dot plots of results
+dotplot(results)
+# Times
+times <- list(XGB = time_xgb, SVML = time_svml, SVMR = time_svmr, RF = time_rf, DT = time_dt, NB = time_nb, LDA = time_lda)
+```
+
+## Testing Models
+```{r testing models}
+xgb_pred <- predict(xgb_model, test_subset)
+svml_pred <- predict(svml_model, test_subset)
+svmr_pred <- predict(svmr_model, test_subset)
+rf_pred <- predict(rf_model, test_subset)
+dt_pred <- predict(dt_model, test_subset)
+nb_pred <- predict(nb_model, test_subset)
+lda_pred <- predict(lda_model, test_subset)
+
+list(
+  XGB = confusionMatrix(xgb_pred, test_subset$Pixel_Type)[2],
+  SVML = confusionMatrix(svml_pred, test_subset$Pixel_Type)[2],
+  SVMR = confusionMatrix(svmr_pred, test_subset$Pixel_Type)[2],
+  RF = confusionMatrix(rf_pred, test_subset$Pixel_Type)[2],
+  DT = confusionMatrix(dt_pred, test_subset$Pixel_Type)[2],
+  NB = confusionMatrix(nb_pred, test_subset$Pixel_Type)[2],
+  LDA = confusionMatrix(lda_pred, test_subset$Pixel_Type)[2]
+)
+```
+
+At a 75/25 training/testing split, all models (except LDA) perfectly predicted the testing set. I started to decrease the number of training samples to 0.5, 0.1, 0.05, and 0.01 percent of the full set. xgbLinear, rf, and rpart all perfectly predicted through 0.05, and started to fail at 0.01 (except rpart, which totally failed). This indicates that the training set does not have to be large to accomplish the goal of predicting endosperm, pericarp, and background pixels. That said, more testing should be done on larger images to make sure.  It might also not hurt to gather more pixel data to begin with since yellow and white corn needs to be split.
+
+Using pixel data that is from the border of seeds is also a good idea as it is generally darker, but take care not to include actual background pixels into the system.
+
+It should also be tested to see how these models predict on seed that I will be cooking for pericarp retention to see just how generalized these models get, or if we need to collect much cleaner data.
+
+6/3/21
+It would be helpful to create a learning curve and training time curve. To do this, I would partition out a testing set and training set.  Then within the training set, I would create a partition again, but only for a sub-training set.  This can be a number of sizes.  I would then train the models on them and save the training set size, time to train, and performance (accuracy) on the testing set.  Both the time and performance can be plotted as a function of training set size to determine how they will perform as more data is collected.  Depending on the shapes of the curves, perhaps a model can be fit to predict training time on a larger set of data.
+
+Later down the road, if there are issues with the prediction performance, perhaps predicting principal components (predict(pixel_pca, test_set)) would help.
+
+## Timing the Training of Models and Assessing Performances
+```{r training time curve}
+train_time_matrix <- matrix(nrow = 0, ncol = 5) # 7 models at 10 reps per; Model, Training Size, Training Time, Training Performance, Testing Performance
+colnames(train_time_matrix) <- c("Model", "Training_Size", "Training_Time", "Training_Accuracy", "Testing_Accuracy")
+for(i in seq(0.05, 0.95, 0.1)){
+  set.seed(i)
+  train_time_subset <- train_subset[createDataPartition(train_subset$Pixel_Type, list = F, p = i),]
+  
+  # Extreme Gradient Boosting
+  set.seed(7)
+  ptm_xgb <- proc.time()
+  xgb_model <- train(Pixel_Type ~ .,
+                        data = train_time_subset,
+                        method = "xgbLinear",
+                        metric = "Accuracy",
+                        tuneGrid = expand.grid(nrounds = c(5), # This section doesn't seem to be important. nrounds = number of iterations (speed)
+                                               lambda = c(0.1), # L2 regularization. Affects weight of loss function (squared)
+                                               alpha = c(0.1), # L1 regualarization. Affects weight of loss function (absolute value)
+                                               eta = c(0.5)), # learning rate (0-1). Lower = more robust to overfitting but slower
+                        trControl = trainControl(method = "cv",
+                                                 savePredictions = T, 
+                                                 allowParallel = T
+                        )
+  )
+  time_xgb <- proc.time() - ptm_xgb
+  
+  model_info <- c("xgbLinear", 
+                  nrow(train_time_subset), 
+                  time_xgb[[3]], 
+                  xgb_model$results$Accuracy, 
+                  confusionMatrix(predict(xgb_model, test_subset), test_subset$Pixel_Type)$overall[[1]])
+  
+  train_time_matrix <- rbind(train_time_matrix, model_info)
+  
+  # SVM Linear Model
+  set.seed(7)
+  ptm_svml <- proc.time()
+  svml_model <- train(Pixel_Type ~ .,
+                        data = train_subset,
+                        method = "svmLinear",
+                        metric = "Accuracy",
+                        tuneGrid = expand.grid(C = c(1)),
+                        trControl = trainControl(method = "cv",
+                                                 savePredictions = T, 
+                                                 allowParallel = T
+                        )
+  )
+  time_svml <- proc.time() - ptm_svml
+  
+  model_info <- c("svmLinear", 
+                  nrow(train_time_subset), 
+                  time_svml[[3]], 
+                  svml_model$results$Accuracy, 
+                  confusionMatrix(predict(svml_model, test_subset), test_subset$Pixel_Type)$overall[[1]])
+  
+  train_time_matrix <- rbind(train_time_matrix, model_info)
+  
+  # SVM Radial Model
+  set.seed(7)
+  ptm_svmr <- proc.time()
+  svmr_model <- train(Pixel_Type ~ .,
+                        data = train_subset,
+                        method = "svmRadial",
+                        metric = "Accuracy",
+                        tuneGrid = expand.grid(C = c(10), sigma = c(10)),
+                        trControl = trainControl(method = "cv",
+                                                 savePredictions = T, 
+                                                 allowParallel = T
+                        )
+  )
+  time_svmr <- proc.time() - ptm_svmr
+  
+  model_info <- c("svmRadial", 
+                  nrow(train_time_subset), 
+                  time_svmr[[3]], 
+                  svmr_model$results$Accuracy, 
+                  confusionMatrix(predict(svmr_model, test_subset), test_subset$Pixel_Type)$overall[[1]])
+  
+  train_time_matrix <- rbind(train_time_matrix, model_info)
+  
+  # Random Forest Model
+  set.seed(7)
+  ptm_rf <- proc.time()
+  rf_model <- train(Pixel_Type ~ .,
+                        data = train_subset,
+                        method = "rf",
+                        metric = "Accuracy",
+                        tuneGrid = expand.grid(mtry = c(2)), 
+                        trControl = trainControl(method = "cv",
+                                                 savePredictions = T, 
+                                                 allowParallel = T
+                        )
+  )
+  time_rf <- proc.time() - ptm_rf
+  
+  model_info <- c("rf", 
+                  nrow(train_time_subset), 
+                  time_rf[[3]], 
+                  rf_model$results$Accuracy, 
+                  confusionMatrix(predict(rf_model, test_subset), test_subset$Pixel_Type)$overall[[1]])
+  
+  train_time_matrix <- rbind(train_time_matrix, model_info)
+  
+  # Decision Tree Model
+  set.seed(7)
+  ptm_dt <- proc.time()
+  dt_model <- train(Pixel_Type ~ .,
+                        data = train_subset,
+                        method = "rpart",
+                        metric = "Accuracy",
+                        tuneGrid = expand.grid(cp = c(0.25)),
+                        trControl = trainControl(method = "cv",
+                                                 savePredictions = T, 
+                                                 allowParallel = T
+                        )
+  )
+  time_dt <- proc.time() - ptm_dt
+  
+  model_info <- c("rpart", 
+                  nrow(train_time_subset), 
+                  time_dt[[3]], 
+                  dt_model$results$Accuracy, 
+                  confusionMatrix(predict(dt_model, test_subset), test_subset$Pixel_Type)$overall[[1]])
+  
+  train_time_matrix <- rbind(train_time_matrix, model_info)
+  
+  # Naive Bayes Model
+  set.seed(7)
+  ptm_nb <- proc.time()
+  nb_model <- train(Pixel_Type ~ .,
+                        data = train_subset,
+                        method = "nb",
+                        metric = "Accuracy",
+                        tuneGrid = expand.grid(usekernel = c(T), fL = c(0), adjust = c(1)),
+                        trControl = trainControl(method = "cv",
+                                                 savePredictions = T, 
+                                                 allowParallel = T
+                        )
+  )
+  time_nb <- proc.time() - ptm_nb
+  
+  model_info <- c("nb", 
+                  nrow(train_time_subset), 
+                  time_nb[[3]], 
+                  nb_model$results$Accuracy, 
+                  confusionMatrix(predict(nb_model, test_subset), test_subset$Pixel_Type)$overall[[1]])
+  
+  train_time_matrix <- rbind(train_time_matrix, model_info)
+  
+  # Linear Discriminant Analysis Model
+  set.seed(7)
+  ptm_lda <- proc.time()
+  lda_model <- train(Pixel_Type ~ .,
+                        data = train_subset,
+                        method = "lda",
+                        metric = "Accuracy",
+                        trControl = trainControl(method = "cv",
+                                                 savePredictions = T, 
+                                                 allowParallel = T
+                        )
+  )
+  time_lda <- proc.time() - ptm_lda
+  
+  model_info <- c("lda", 
+                  nrow(train_time_subset), 
+                  time_lda[[3]], 
+                  lda_model$results$Accuracy, 
+                  confusionMatrix(predict(lda_model, test_subset), test_subset$Pixel_Type)$overall[[1]])
+  
+  train_time_matrix <- rbind(train_time_matrix, model_info)
+}
+
+train_time_matrix %>%
+  as_tibble() %>%
+  mutate(Training_Size = as.numeric(Training_Size),
+         Training_Time = as.numeric(Training_Time),
+         Training_Accuracy = as.numeric(Training_Accuracy),
+         Testing_Accuracy = as.numeric(Testing_Accuracy)) %>%
+  ggplot(aes(x = Training_Size, y = Training_Time, color = Model))+
+  geom_line()
+```
+The training set size does not seem to be affecting the training time whatsoever. Perhaps it will make more of a difference if there were thousands of data points, but considering that the models achieve perfect testing accuracy at around 30 training points, I see no reason yet to extend the training set to the thousands.
+
+It is also not worth plotting the learning curve as all models except LDA perform perfectly on all training sizes. 
+
+Based on the above data and information, I think it will be best to stay away from LDA ("low" performance), RF (slowest model), and NB (second slowest model; noticeably slower than the rest).  This leaves us with XGBoost, SVM Linear, SVM Radial, and a basic Decision Tree.  All perform perfectly (XGBoost lost accuracy with training size of 6 whereas others somehow didn't), and train equally quickly.
+
+I think the best next step will be to test the models on some real images.  I have saved a couple that are entirely background, pericarp, and endosperm to see if any models are fooled by the absence of the other classifications.  This is less important than performance on a real image, but important to know when deciding between models.
+
+I also have a (small) labeled image with all three classifications.  This can be used as an entirely new dataset for the models to be tested on.
+
+Lastly, I can use the model on a full image to see how it compares on a by-eye-basis.
+
+```{r load and prepare full background photo}
+background <- readImage("../Data/Images/POC/white_validation_all_background.jpg")
+background_255 <- background*255
+
+full_color_bkg <- channel(transpose(background_255), mode = "red") %>% # extracting 
+  as_tibble() %>%
+  mutate(row = row_number()) %>%
+  pivot_longer(cols = -row, names_to = "column", values_to = "Red", names_prefix = "V") %>%
+  full_join(
+    channel(transpose(background_255), mode = "green") %>% # extracting 
+    as_tibble() %>%
+    mutate(row = row_number()) %>%
+    pivot_longer(cols = -row, names_to = "column", values_to = "Green", names_prefix = "V")) %>%
+  full_join(
+    channel(transpose(background_255), mode = "blue") %>% # extracting 
+    as_tibble() %>%
+    mutate(row = row_number()) %>%
+    pivot_longer(cols = -row, names_to = "column", values_to = "Blue", names_prefix = "V"))
+
+bkg_annotated <- read_csv("../Data/white_validation_all_backgroud_annotated.csv") %>%
+  rename(row = X1) %>%
+  pivot_longer(cols = -row, names_to = "column", values_to = "annotation") %>%
+  full_join(full_color_bkg) 
+
+sum(is.na(bkg_annotated))
+
+svml_pred <- predict(svml_model, bkg_annotated)
+paste("SVML non-background predictions: ",sum(svml_pred != "background"))
+svmr_pred <- predict(svmr_model, bkg_annotated)
+paste("SVMR non-background predictions: ",sum(svmr_pred != "background"))
+xgb_pred <- predict(xgb_model, bkg_annotated)
+paste("XGB non-background predictions: ",sum(xgb_pred != "background"))
+dt_pred <- predict(dt_model, bkg_annotated)
+paste("DT non-background predictions: ",sum(dt_pred != "background"))
+```
+Each model perfectly predicted the fully background image (expected)
+
+
+```{r load and prepare full pericarp photo}
+pericarp <- readImage("../Data/Images/POC/white_validation_all_pericarp.jpg")
+pericarp_255 <- pericarp*255
+
+full_color_peri <- channel(transpose(pericarp_255), mode = "red") %>% # extracting 
+  as_tibble() %>%
+  mutate(row = row_number()) %>%
+  pivot_longer(cols = -row, names_to = "column", values_to = "Red", names_prefix = "V") %>%
+  full_join(
+    channel(transpose(pericarp_255), mode = "green") %>% # extracting 
+    as_tibble() %>%
+    mutate(row = row_number()) %>%
+    pivot_longer(cols = -row, names_to = "column", values_to = "Green", names_prefix = "V")) %>%
+  full_join(
+    channel(transpose(pericarp_255), mode = "blue") %>% # extracting 
+    as_tibble() %>%
+    mutate(row = row_number()) %>%
+    pivot_longer(cols = -row, names_to = "column", values_to = "Blue", names_prefix = "V"))
+
+peri_annotated <- read_csv("../Data/white_validation_all_pericarp_annotated.csv") %>%
+  rename(row = X1) %>%
+  pivot_longer(cols = -row, names_to = "column", values_to = "annotation") %>%
+  full_join(full_color_peri) 
+
+sum(is.na(peri_annotated))
+
+svml_pred <- predict(svml_model, peri_annotated)
+paste("SVML non-pericarp predictions: ",sum(svml_pred != "pericarp"))
+svmr_pred <- predict(svmr_model, peri_annotated)
+paste("SVMR non-pericarp predictions: ",sum(svmr_pred != "pericarp"))
+xgb_pred <- predict(xgb_model, peri_annotated)
+paste("XGB non-pericarp predictions: ",sum(xgb_pred != "pericarp"))
+dt_pred <- predict(dt_model, peri_annotated)
+paste("DT non-pericarp predictions: ",sum(dt_pred != "pericarp"))
+```
+Each model perfectly predicted the full pericarp image as well.
+
+```{r load and prepare full endosperm photo}
+endosperm <- readImage("../Data/Images/POC/white_validation_all_endosperm.jpg")
+endosperm_255 <- endosperm*255
+
+full_color_endo <- channel(transpose(endosperm_255), mode = "red") %>% # extracting 
+  as_tibble() %>%
+  mutate(row = row_number()) %>%
+  pivot_longer(cols = -row, names_to = "column", values_to = "Red", names_prefix = "V") %>%
+  full_join(
+    channel(transpose(endosperm_255), mode = "green") %>% # extracting 
+    as_tibble() %>%
+    mutate(row = row_number()) %>%
+    pivot_longer(cols = -row, names_to = "column", values_to = "Green", names_prefix = "V")) %>%
+  full_join(
+    channel(transpose(endosperm_255), mode = "blue") %>% # extracting 
+    as_tibble() %>%
+    mutate(row = row_number()) %>%
+    pivot_longer(cols = -row, names_to = "column", values_to = "Blue", names_prefix = "V"))
+
+endo_annotated <- read_csv("../Data/white_validation_all_endosperm_annotated.csv") %>%
+  rename(row = X1) %>%
+  pivot_longer(cols = -row, names_to = "column", values_to = "annotation") %>%
+  full_join(full_color_endo) 
+
+sum(is.na(endo_annotated))
+
+svml_pred <- predict(svml_model, endo_annotated)
+paste("SVML non-endosperm predictions: ",sum(svml_pred != "endosperm"))
+svmr_pred <- predict(svmr_model, endo_annotated)
+paste("SVMR non-endosperm predictions: ",sum(svmr_pred != "endosperm"))
+xgb_pred <- predict(xgb_model, endo_annotated)
+paste("XGB non-endosperm predictions: ",sum(xgb_pred != "endosperm"))
+dt_pred <- predict(dt_model, endo_annotated)
+paste("DT non-endosperm predictions: ",sum(dt_pred != "endosperm"))
+```
+Each model perfectly predicted the full endosperm picture
+
+
+```{r load and prepare partial kernel photo}
+partial <- readImage("../Data/Images/POC/white_validation_partial_kernel.jpg")
+partial_255 <- partial*255
+
+full_color_part <- channel(transpose(partial_255), mode = "red") %>% # extracting 
+  as_tibble() %>%
+  mutate(row = row_number()) %>%
+  pivot_longer(cols = -row, names_to = "column", values_to = "Red", names_prefix = "V") %>%
+  full_join(
+    channel(transpose(partial_255), mode = "green") %>% # extracting 
+    as_tibble() %>%
+    mutate(row = row_number()) %>%
+    pivot_longer(cols = -row, names_to = "column", values_to = "Green", names_prefix = "V")) %>%
+  full_join(
+    channel(transpose(partial_255), mode = "blue") %>% # extracting 
+    as_tibble() %>%
+    mutate(row = row_number()) %>%
+    pivot_longer(cols = -row, names_to = "column", values_to = "Blue", names_prefix = "V"))
+
+part_annotated <- read_csv("../Data/white_validation_partial_kernel_annotated.csv") %>%
+  rename(row = X1) %>%
+  pivot_longer(cols = -row, names_to = "column", values_to = "annotation") %>%
+  full_join(full_color_part) 
+
+sum(is.na(part_annotated))
+
+svml_pred <- predict(svml_model, part_annotated)
+sum(svml_pred == part_annotated$annotation) / nrow(part_annotated)
+svmr_pred <- predict(svmr_model, part_annotated)
+sum(svmr_pred == part_annotated$annotation) / nrow(part_annotated)
+xgb_pred <- predict(xgb_model, part_annotated)
+sum(xgb_pred == part_annotated$annotation) / nrow(part_annotated)
+dt_pred <- predict(dt_model, part_annotated)
+sum(dt_pred == part_annotated$annotation) / nrow(part_annotated)
+```
+Not all models performed the same when looking at the edge of a partial kernel. I think a large reason for this is how dark the edge of kernels get.  To the naked eye it is obvious something is there, but not when you are just looking at the RGB values.
+
+It appears that the radial SVM performed the best, which sort of makes sense with the radial nature of kernels, but it did not perform significantly different from the other models.
+
+```{r loading first whole kernel validation image}
+wk_pericarp <- read_csv("../Data/Images/POC/white_validation_whole_kernel_pericarp.csv") %>%
+  mutate(X = X+1,
+         Y = Y+1) %>%
+  mutate(position = paste0(X,"_",Y),
+         Label = "pericarp") %>%
+  dplyr::select(-X, -Y)
+
+wk_kernel <- read_csv("../Data/Images/POC/white_validation_whole_kernel_kernel.csv") %>%
+  mutate(X = X+1,
+         Y = Y+1) %>%
+  mutate(position = paste0(X,"_",Y)) %>%
+  filter(!position %in% wk_pericarp$position) %>%
+  dplyr::select(-X, -Y) %>%
+  mutate(Label = "endosperm")
+
+whole_kernel <- readImage("../Data/Images/POC/white_validation_whole_kernel.jpg")
+whole_kernel_255 <- whole_kernel*255
+
+wk_background <- channel(transpose(whole_kernel_255), mode = "red") %>% # extracting 
+  as_tibble() %>%
+  mutate(row = row_number()) %>%
+  pivot_longer(cols = -row, names_to = "column", values_to = "Red", names_prefix = "V") %>%
+  full_join(
+    channel(transpose(whole_kernel_255), mode = "green") %>% # extracting 
+    as_tibble() %>%
+    mutate(row = row_number()) %>%
+    pivot_longer(cols = -row, names_to = "column", values_to = "Green", names_prefix = "V")) %>%
+  full_join(
+    channel(transpose(whole_kernel_255), mode = "blue") %>% # extracting 
+    as_tibble() %>%
+    mutate(row = row_number()) %>%
+    pivot_longer(cols = -row, names_to = "column", values_to = "Blue", names_prefix = "V")) %>%
+  mutate(position = paste0(column,"_",row)) %>% 
+  ungroup() %>%
+  filter(!position %in% wk_pericarp$position) %>%
+  filter(!position %in% wk_kernel$position) %>%
+  dplyr::select(-row, -column) %>%
+  mutate(Label = "background")
+
+whole_kernel_annotation <- bind_rows(wk_kernel, wk_background) %>%
+  bind_rows(wk_pericarp)
+
+# With background
+svml_pred <- predict(svml_model, whole_kernel_annotation)
+sum(svml_pred == whole_kernel_annotation$Label) / nrow(whole_kernel_annotation)
+svmr_pred <- predict(svmr_model, whole_kernel_annotation)
+sum(svmr_pred == whole_kernel_annotation$Label) / nrow(whole_kernel_annotation)
+xgb_pred <- predict(xgb_model, whole_kernel_annotation)
+sum(xgb_pred == whole_kernel_annotation$Label) / nrow(whole_kernel_annotation)
+dt_pred <- predict(dt_model, whole_kernel_annotation)
+sum(dt_pred == whole_kernel_annotation$Label) / nrow(whole_kernel_annotation)
+
+# Without background
+whole_kernel_bkg_rm <- filter(whole_kernel_annotation, Label != "background")
+svml_pred_bkg_rm <- predict(svml_model, whole_kernel_bkg_rm)
+sum(svml_pred_bkg_rm == whole_kernel_bkg_rm$Label) / nrow(whole_kernel_bkg_rm)
+svmr_pred_bkg_rm <- predict(svmr_model, whole_kernel_bkg_rm)
+sum(svmr_pred_bkg_rm == whole_kernel_bkg_rm$Label) / nrow(whole_kernel_bkg_rm)
+xgb_pred_bkg_rm <- predict(xgb_model, whole_kernel_bkg_rm)
+sum(xgb_pred_bkg_rm == whole_kernel_bkg_rm$Label) / nrow(whole_kernel_bkg_rm)
+dt_pred_bkg_rm <- predict(dt_model, whole_kernel_bkg_rm)
+sum(dt_pred_bkg_rm == whole_kernel_bkg_rm$Label) / nrow(whole_kernel_bkg_rm)
+
+nrow(whole_kernel)*ncol(whole_kernel) - nrow(wk_pericarp) - nrow(wk_kernel) - nrow(wk_background)
+```
+
+```{r comparing true and predicted pixels classes of first whole kernel image}
+whole_kernel_annotation %>%
+  mutate(Prediction = svml_pred) %>%
+  pivot_longer(cols = c(Label, Prediction), names_to = "Type", values_to = "Class") %>%
+  separate(col = position, into = c("X","Y"), sep = "_") %>%
+  mutate(X = as.numeric(X), Y = as.numeric(Y)) %>%
+  ggplot(aes(x = X, y = Y, fill = Class))+
+    geom_tile()+
+    facet_wrap(~Type)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Load the Final Test Image
+```{r load final test image}
+image <- readImage("../Data/Images/POC/background_removed_highly_filtered.jpg")
+image_255 <- image*255
+ncol(image_255)
+```
+
+```{r splitting channels}
+red_chan <- channel(image_255, mode = "red") %>% # extracting 
+  as_tibble() %>%
+  mutate(row = row_number()) %>%
+  pivot_longer(cols = -row, names_to = "column", values_to = "Red", names_prefix = "V")
+
+green_chan <- channel(image_255, mode = "green") %>% # extracting 
+  as_tibble() %>%
+  mutate(row = row_number()) %>%
+  pivot_longer(cols = -row, names_to = "column", values_to = "Green", names_prefix = "V")
+
+blue_chan <- channel(image_255, mode = "blue") %>% # extracting 
+  as_tibble() %>%
+  mutate(row = row_number()) %>%
+  pivot_longer(cols = -row, names_to = "column", values_to = "Blue", names_prefix = "V")
+
+full_color <- red_chan %>%
+  full_join(green_chan) %>%
+  full_join(blue_chan)
+
+head(full_color)
+```
+```{r predictions, warning=F, message=F, error=F}
+predictions <- predict(xgb_model, full_color)
+```
+
+```{r writing out predictions with dataset}
+full_color %>%
+  mutate(Pixel_Type = predictions) %>% 
+  write_delim("../Outputs/Exploration/xgb_classes_by_pixel.txt")
+```
+
+```{r plotting predictions}
+xgb_plot <- full_color %>%
+  mutate(Pixel_Type = predictions) %>%
+  ggplot(aes(x = as.numeric(row), y = as.numeric(column), fill = Pixel_Type))+
+  geom_tile()+
+  scale_fill_manual(values = c("black", "yellow", "blue"))+
+  scale_y_reverse()+
+  theme_classic()+
+  labs(x = NULL,
+       y = NULL)+
+  theme(axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.line = element_blank(),
+        axis.ticks = element_blank())
+
+xgb_plot
+
+ggsave(xgb_plot, file = "../Outputs/Exploration/white_xgb_classification_plot.png", device = "png", dpi = 300, width = 4.2, height = 5.62, units = "in")
+```
+
+
+
+```{r}
+full_color %>%
+  mutate(Red_Pred = case_when(Red < 40 ~ "Background",
+                              Red >= 40 & Red < 140 ~ "Pericarp",
+                              Red >= 140 ~ "Endosperm"),
+         Green_Pred = case_when(Green < 40 ~ "Background",
+                                Green >= 40 & Green < 150 ~ "Pericarp",
+                                Green >= 150 ~ "Endosperm"),
+         Blue_Pred = case_when(Blue < 40 ~ "Background",
+                               Blue >= 40 & Blue < 130 ~ "Pericarp",
+                               Blue >= 130 ~ "Endosperm")) %>%
+  ggplot(aes(x = as.numeric(row), y = as.numeric(column), fill = Red_Pred))+
+  geom_tile()+
+  scale_y_reverse()+
+  theme_classic()
+```
+

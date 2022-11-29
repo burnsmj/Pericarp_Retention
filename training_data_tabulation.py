@@ -24,50 +24,62 @@ into a column of comma separated values.
 # Import Packages #
 ###################
 import pandas as pd # Data wrangling and manipulation
+import numpy as np
+from skimage import color
 
-############################
-# Create Lists to Populate #
-############################
-pericarp = []
-endosperm = []
-background = []
+###################################################
+# Create a Dictionary to Populate with Pixel Data #
+###################################################
+pixel_dict = {}
 
-#############################
-# Read in Data Line by Line #
-#############################
-with open('../Data/White_Pixel_Values_for_Training.txt') as imagej_data: # Load data file path to read line by line
+#######################################
+# Populate Dictionary with Pixel Data #
+#######################################
+with open('../Data/White_3_Levels_Training_Data.txt') as imagej_data: # Load data file path to read line by line
     lines = imagej_data.readlines() # Read in dataset line by line
     for line in lines: # Loop to iterate through lines
         #print('Line:', line) # For possible future debugging; Print the line we are working on
         if line.startswith('#'): # If the line starts with a #, save it as the variable we will use to separate the data
-            current_header = line.strip() # need to strip the line of whitespaces before comparing it (likely due to new line character)
-        elif current_header == '#Pericarp': # For the pericarp data...
-            line_items = line.split() # Split the values by whitespace
-            pericarp += line_items # Add the data to the pericarp list
-        elif current_header == '#Aleurone': # For the pericarp data...
-            line_items = line.split() # Split the values by whitespace
-            endosperm += line_items # Add the data to the pericarp list
-        elif current_header == '#Background': # For the pericarp data...
-            line_items = line.split() # Split the values by whitespace
-            background += line_items # Add the data to the pericarp list
-        else:
-            print('Error: Data does not contain the required section headers: #pericarp, #endosperm, #background')
-            break
+            current_header = line.strip('#\n') # need to strip the line of whitespaces before comparing it (likely due to new line character)
+        if current_header not in pixel_dict:
+            pixel_dict[current_header] = []
+            continue
+        pixel_dict[current_header] += line.split()
 
-assert len(pericarp) == len(endosperm) and len(pericarp) == len(background) # Make sure each dataset is the same size. This can be removed later if its better to collect more of one dataset than another.
+###################################
+# Create Empty Data Frame to Fill #
+###################################
+tab_data = pd.DataFrame(columns = ('Label', 'Red', 'Green', 'Blue', 
+                                   'Hue', 'Saturation', 'Value', 
+                                   'Luminosity', 'A_Axis', 'B_Axis'))
 
-#print(pericarp) # For possible future debugging
-#print(endosperm) # For possible future debugging
-#print(background) # For possible future debugging
+###################################################
+# Compile Color Space Data for Training Data File #
+###################################################
+for name, label in pixel_dict.items():
+    np_label = np.array([p.split(',') for p in label], dtype = int) # skimage color space converters work on 2D arrays
 
+    label_rgb = np_label.astype('uint8') # Needs to by uint8 for rgb2hsv to work, trust me...
+    label_hsv = color.rgb2hsv(label_rgb) 
+    label_lab = color.rgb2lab(label_rgb / 255) # rgb2lab expects data to be in the range of 0-1
 
-###########################
-# Turn Lists into Columns #
-###########################
-tab_data = pd.DataFrame(data = [pericarp, endosperm, background]).transpose() # Turn list into dataframe columns and transpose to make 3 columns
-tab_data.columns = ['Pericarp', 'Aleurone', 'Background'] # Add headers to each column
+    concat_data = pd.DataFrame({'Label' : np.array([name] * len(label)).ravel().tolist(),
+                                'Red' : label_rgb[:,0].ravel().tolist(),
+                                'Green' : label_rgb[:,1].ravel().tolist(),
+                                'Blue' : label_rgb[:,2].ravel().tolist(),
+                                'Hue' : label_hsv[:,0].ravel().tolist(),
+                                'Saturation' : label_hsv[:,1].ravel().tolist(),
+                                'Value' : label_hsv[:,2].ravel().tolist(),
+                                'Luminosity' : label_lab[:,0].ravel().tolist(),
+                                'A_Axis' : label_lab[:,1].ravel().tolist(),
+                                'B_Axis' : label_lab[:,2].ravel().tolist()},
+                               columns = ('Label', 'Red', 'Green', 'Blue', 
+                                                                  'Hue', 'Saturation', 'Value', 
+                                                                  'Luminosity', 'A_Axis', 'B_Axis'))
+
+    tab_data = tab_data.append(concat_data, ignore_index = True)
 
 ###############################
 # Write out Tabulated Dataset #
 ###############################
-tab_data.to_csv('../Data/White_Corn_Tabulated_Training_Data.txt', sep = '\t', index = False)
+tab_data.to_csv('../Data/White_Corn_Tabulated_3_Level_Training_Data.txt', sep = '\t', index = False)
