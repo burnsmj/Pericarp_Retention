@@ -1,1 +1,10 @@
+Chemometrics:
 
+Using machine learning approaches, near-infrared spectroscopy is being used to predictively determine the quantity of pericarp maintained by kernels after nixtamalization. 
+
+Folders:
+Scripts:
+- Scripts used for analysis
+
+Data:
+- Data collected during experiment
