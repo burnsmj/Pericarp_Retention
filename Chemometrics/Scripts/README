@@ -1,1 +1,2 @@
-Foss_NIR_Data.html - HTML 
+Foss_NIR_Data.html - HTML R markdown file for FOSS_NIR_Code.RMD
+FOSS_NIR_Code.Rmd - full R script for spectral analysis and sample selection of hybrid maize data
