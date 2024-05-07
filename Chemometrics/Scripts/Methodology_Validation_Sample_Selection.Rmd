@@ -1,0 +1,883 @@
+---
+title: "Foss_NIR_Data"
+output: html_document
+date: "2024-02-21"
+---
+# Load in Libraries
+```{r libraries}
+library(prospectr)
+library(ggplot2)
+library(tidyverse)
+library(caret)
+library(stringr)
+```
+# Load in Data
+First I need to import the 2 .csv files into R.
+```{r load in data}
+raw_data <- read_csv("~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/YCH_Scan_Data_part1.csv")
+genotypes_data <- read_csv("~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/YCH_Plot_2_Genotype.csv")
+```
+# Modify the Data
+I need to modify and filter the data so I can work with it. This involves removing a row of the data that is not needed in the analysis and naming the first column.
+```{r modify data}
+#remove empty row
+cleaned_data <- raw_data[-c(1), ]
+#rename Wavelength row
+cleaned_data <- cleaned_data %>%
+  rename("Wavelength" = "...1")
+#remove 'sample no:' from sample names
+colnames(cleaned_data) <- gsub("sample no: ", "", colnames(cleaned_data))
+```
+
+# Pivot Table
+I need to change the format of the current data so that ggplot() will be able to make a table with it. Also, I need to use mutate() to change the character types to numerical types. Finally, the filter() function will remove every wavelength that is not filled in on the dataset.
+```{r pivot and modify data}
+#create pivot table and filter wavelength for every 5th wavelength instead of every 0.5 nm
+pivot_data <- pivot_longer(cleaned_data, cols = -c(Wavelength), names_to = 'SampleID', values_to = 'Absorbance') %>%
+  mutate(Wavelength = as.numeric(Wavelength)) %>%
+  mutate(Absorbance = as.numeric(Absorbance)) %>%
+  filter(!is.na(Absorbance),
+         Wavelength %% 5 == 0)
+#add year to data frame by indexing sample name based on place of year number
+pivot_data$Year <- ifelse(substr(pivot_data$SampleID, 3, 3) == "H",
+                                substr(pivot_data$SampleID, 4, 5),
+                                substr(pivot_data$SampleID, 3, 4))
+#reorder data frame so year is 2nd column and remove NA years, "61", "69", and "mp"
+pivot_data <- pivot_data[, c(2, 4, 1, 3)] %>%
+  filter(!is.na(Year)) %>%
+  subset(Year != "61" & Year != "69" & Year != "mp")
+#removing any samples that aren't YCH and any sample names that include '...'
+pivot_data <- pivot_data %>%
+  filter(str_detect(SampleID, "YCH")) %>%
+  mutate(SampleID = str_replace(SampleID, "\\.\\.\\.\\d+$", ""))
+#add genotypes into pivot data
+pivot_data <- left_join(pivot_data, genotypes_data, join_by(SampleID == Plot))
+#remove any samples that have a genotype containing RIB
+pivot_data <- pivot_data[!str_detect(pivot_data$Genotype, "RIB$"), ]
+pivot_data <- pivot_data[!str_detect(pivot_data$Genotype, "FILL"), ]
+#move genotypes column to front
+pivot_data <- pivot_data[, c(1, 2, 5, 3, 4)]
+#split genotypes into egg parent and pollen parent
+pivot_data <- separate(pivot_data, Genotype, into = c("Egg_Parent", "Pollen_Parent"), sep = " [x,X] ", remove = FALSE)
+
+#create wide data table
+data_wide <- pivot_data %>%
+  pivot_wider(id_cols = c(SampleID, Year, Genotype, Egg_Parent, Pollen_Parent), names_from = Wavelength, values_from = Absorbance)
+#unnest data table
+data_wide <- unnest(data_wide, cols = everything())
+#remove duplicate samples
+data_wide <- data_wide %>%
+  distinct(SampleID, .keep_all = TRUE)
+#pivot back to long form
+pivot_data <- pivot_longer(data_wide, cols = -c(SampleID, Year, Genotype, Egg_Parent, Pollen_Parent), names_to = 'Wavelength', values_to = 'Absorbance') %>%
+  mutate(Wavelength = as.numeric(Wavelength))
+```
+
+Now that the data has been modified and become a pivot chart, I can make a plot of the spectral data presented.
+# Making the Spectral Plot
+```{r spectral plot}
+#plot unfiltered spectral plot
+pivot_data %>%
+  ggplot(aes(x = Wavelength, y = Absorbance, group = SampleID))+
+  geom_line(aes(col=Year))+
+  labs(title = "Unfiltered Spectral Data")+
+  facet_wrap(~Year)+
+  theme_classic()
+```
+
+# PCA
+Now I can use the data file from the last section to perform a PCA.
+```{r pca}
+#calculate PC's
+unfiltered_data_pca <- prcomp(data_wide[,-c(1,2,3,4,5)], center = TRUE, scale. = TRUE)
+```
+# PCA Plot
+```{r pca plot}
+#plot PC1 vs PC2
+data_wide %>%
+  select(1:5) %>%
+  bind_cols(as_tibble(unfiltered_data_pca$x)) %>%
+  ggplot(aes(x = PC1, y = PC2, col = Year)) +
+  geom_point() +
+  stat_ellipse() +
+  labs(title = 'PCA of Unfilitered Spectral Data') +
+  theme_classic()
+```
+
+# Filtering Outliers
+I will now remove any outlier spectra from the NIR data so that I know those are not included in the sample selection. I will do this using the Mahalanobis Distance Code.
+```{r mahalanobis distance for outlier removal}
+#waveband matrix
+wavebands <- (seq(400, 1099.5, 5))
+#calculate the mahalanobis distance
+m_dist <- as.matrix(mahalanobis(data_wide[,colnames(data_wide) %in% wavebands],                                colMeans(data_wide[,colnames(data_wide) %in% wavebands]),
+                    cov(data_wide[,colnames(data_wide) %in% wavebands]), na.rm=TRUE))
+#appends Mdist to data_wide
+data_wide$Mdist = round(m_dist, 1)
+#create data frame without outliers
+outliers_removed_data <- data_wide %>%
+  mutate(MThresh = 3 * mean(Mdist)) %>%
+  filter(Mdist < MThresh) %>%
+  select(-Mdist,
+         -MThresh) #this removed 27 samples
+```
+# Verify Removal of Outliers
+Now that the outliers are removed, I will make sure that these are removed from the sample set by looking at the spectral plot and PCA again.
+```{r pivot clean data}
+#create pivot table for outliers removed
+outliers_removed_pivot <- pivot_longer(outliers_removed_data, cols = -c(SampleID, Year, Genotype, Egg_Parent, Pollen_Parent), names_to = 'Wavelength', values_to = 'Absorbance') %>%
+  filter(!is.na(Absorbance)) %>%
+  mutate(Wavelength = as.numeric(Wavelength))
+
+#make spectral plot
+outliers_removed_pivot %>%
+  ggplot(aes(x = Wavelength, y = Absorbance, group = SampleID))+
+  geom_line(aes(col=Year))+
+  labs(title = "Cleaned Spectral Data")+
+  scale_x_continuous(breaks=seq(400, 1095, 100))+
+  scale_y_continuous(breaks=seq(0, 10, 1))+
+  facet_wrap(~Year)+
+  theme_classic()
+```
+
+```{r clean pca} 
+#calculate PC's for outliers removed data
+pca_clean <- prcomp(outliers_removed_data[,-c(1:5)], center = TRUE, scale. = TRUE)
+#plot PC1 vs PC2
+outliers_removed_data %>%
+  select(1:5) %>%
+  bind_cols(as_tibble(pca_clean$x)) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Year)) +
+  geom_point() +
+  stat_ellipse() +
+  labs(title = 'PCA of Cleaned Spectral Data') +
+  theme_classic()
+```
+
+# Normalizing the Data
+There are multiple different normalization features in the prospectr package. I'm going to test all of these and determine which one works the best for this data.
+Baseline, Detrend, SNV
+```{r baseline spectral}
+#Estimates the baseline of a given spectrum and subtracts it from the original spectrum. Pulls convex hull points of each spectrum are identified, these are linearly interpolated to the same frequencies of the original spectra. Linearly interpolated: means that intermediate data between known values is connected with a conceptual straight line.Baseline of each spectrum is subtracted from the original inpur spectrum. Aims to reset all of the spectra on a common baseline. Caution in interpreting because it can distort the real proportions between absorbance peaks.
+#Normalizations
+b_normalization <- baseline(outliers_removed_data[,-c(1:5)], wav = as.numeric(colnames(outliers_removed_data[,-c(1:5)])))
+
+#Combine data sets to include Sample ID
+baseline_normalization <- outliers_removed_data %>%
+  select("SampleID", "Year", "Genotype", "Egg_Parent", "Pollen_Parent") %>%
+  bind_cols(as_tibble(b_normalization))
+
+#Pivot Table
+baseline_normalization_pivot <- baseline_normalization %>%
+  pivot_longer(cols = -c(SampleID, Year, Genotype, Egg_Parent, Pollen_Parent),
+               names_to = "Wavelength",
+               values_to = "Absorbance") %>%
+  mutate(Wavelength = as.numeric(Wavelength))
+
+#Spectral plot
+baseline_normalization_pivot %>%
+  ggplot(aes(x = Wavelength, y = Absorbance, group = SampleID))+
+  geom_line(aes(col=Year))+
+  labs(title = "Baseline Normalized Spectral Plot")+
+  facet_wrap(~Year)+
+  theme_classic()
+```
+
+```{r baseline pca}
+#Check for zero variance
+NZV_baseline <- nearZeroVar(baseline_normalization)
+baseline_normalization <- baseline_normalization[, -NZV_baseline]
+#PCA
+baseline_pca = prcomp(baseline_normalization[,-c(1:5)], scale. = TRUE, center = TRUE)
+#Plot PCA
+baseline_normalization %>%
+  select(1:5) %>%
+  bind_cols(as_tibble(baseline_pca$x)) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Year)) +
+  geom_point() +
+  stat_ellipse() +
+  labs(title = 'PCA of Baseline-Normalized Data') +
+  theme_classic()
+```
+
+```{r detrend spectra}
+#Accounts for wavelength-dependent scattering effects. Corrects for curvilinear effects in spectra of tightly packed samples. Curvature of spectra depends on packing density and particle sizes of a specific samples, detrend standardizes the variation in the curvilinearity. Aims to show only the differences in values from the trend.
+#Normalization
+d_normalization <- detrend(outliers_removed_data[,-c(1:5)], wav = as.numeric(colnames(outliers_removed_data[,-c(1:5)], p = 2)))
+#Combine data sets to include SampleID
+detrend_normalization <- outliers_removed_data %>%
+  select("SampleID", "Year", "Genotype", "Egg_Parent", "Pollen_Parent") %>%
+  bind_cols(as_tibble(d_normalization))
+#Pivot table
+detrend_normalization_pivot <- detrend_normalization %>%
+  pivot_longer(cols = -c(SampleID, Year, Genotype, Egg_Parent, Pollen_Parent),
+               names_to = "Wavelength",
+               values_to = "Absorbance") %>%
+  mutate(Wavelength = as.numeric(Wavelength))
+#Spectral plot
+detrend_normalization_pivot %>%
+  ggplot(aes(x = Wavelength, y = Absorbance, group = SampleID))+
+  geom_line(aes(col=Year))+
+  labs(title = "Detrend Normalized Spectral Plot")+
+  facet_wrap(~Year)+
+  theme_classic()
+```
+
+```{r detrend pca}
+#PCA
+detrend_pca = prcomp(detrend_normalization[,6:145], scale. = TRUE, center = TRUE)
+#Plot PCA
+detrend_normalization %>%
+  select(1:5) %>%
+  bind_cols(as_tibble(detrend_pca$x)) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Year)) +
+  geom_point() +
+  stat_ellipse() +
+  labs(title = 'PCA of Detrend-Normalized Data') +
+  theme_classic()
+```
+
+```{r snv spectral}
+#SNV tries to correct for light scatter on a row-wise operation. Removes the multiplicative interferences of scatter and particle size. Compared to original datasets, there is no divergence between similar samples with varying particle size, but the overall shape does not change.
+#Normalization
+s_normalization <- standardNormalVariate(outliers_removed_data[,-c(1:5)])
+#Combine data sets to include SampleID
+snv_normalization <- outliers_removed_data %>%
+  select("SampleID", "Year", "Genotype", "Egg_Parent", "Pollen_Parent") %>%
+  bind_cols(as_tibble(s_normalization))
+#Pivot table
+snv_normalization_pivot <- snv_normalization %>%
+  pivot_longer(cols = -c(SampleID, Year, Genotype, Egg_Parent, Pollen_Parent),
+               names_to = "Wavelength",
+               values_to = "Absorbance") %>%
+  mutate(Wavelength = as.numeric(Wavelength))
+#Spectral plot
+snv_normalization_pivot %>%
+  ggplot(aes(x = Wavelength, y = Absorbance, group = SampleID))+
+  geom_line(aes(col=Year))+
+  labs(title = "SNV Normalized Spectral Plot")+
+  facet_wrap(~Year)+
+  theme_classic()
+```
+
+```{r snv pca}
+#PCA
+snv_pca = prcomp(snv_normalization[,6:145], scale. = TRUE, center = TRUE)
+#Plot PCA
+snv_normalization %>%
+  select(1:5) %>%
+  bind_cols(as_tibble(snv_pca$x)) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Year)) +
+  geom_point() +
+  stat_ellipse() +
+  labs(title = 'PCA of SNV-Normalized Data') +
+  theme_classic()
+```
+
+```{r baseline on snv spectral}
+#Normalizations
+baseline_on_snv <- baseline(s_normalization, wav = as.numeric(colnames(s_normalization)))
+#Combine data sets to include Sample ID
+baseline_on_snv <- outliers_removed_data %>%
+  select("SampleID", "Year", "Genotype", "Egg_Parent", "Pollen_Parent") %>%
+  bind_cols(as_tibble(baseline_on_snv))
+#Pivot Table
+baseline_on_snv <- baseline_on_snv %>%
+  pivot_longer(cols = -c(SampleID, Year, Genotype, Egg_Parent, Pollen_Parent),
+               names_to = "Wavelength",
+               values_to = "Absorbance") %>%
+  mutate(Wavelength = as.numeric(Wavelength))
+#Spectral plot
+baseline_on_snv %>%
+  ggplot(aes(x = Wavelength, y = Absorbance, group = SampleID))+
+  geom_line(aes(col=Year))+
+  labs(title = "Baseline on SNV Normalized Data Spectral Plot")+
+  facet_wrap(~Year)+
+  theme_classic()
+```
+
+```{r baseline on snv pca}
+#Pivot to wide format
+baseline_on_snv_wide <- baseline_on_snv %>%
+  pivot_wider(id_cols = c(SampleID, Year, Genotype, Egg_Parent, Pollen_Parent), names_from = Wavelength, values_from = Absorbance)
+baseline_on_snv_wide <- unnest(baseline_on_snv_wide, cols = everything())
+#Check for zero variance
+NZV_baseline_snv <- nearZeroVar(baseline_on_snv_wide)
+baseline_on_snv_wide <- baseline_on_snv_wide[, -NZV_baseline_snv]
+#PCA
+baseline_snv_pca = prcomp(baseline_on_snv_wide[,6:134], scale. = TRUE, center = TRUE)
+#Plot PCA
+baseline_on_snv_wide %>%
+  select(1:5) %>%
+  bind_cols(as_tibble(baseline_snv_pca$x)) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Year)) +
+  geom_point() +
+  stat_ellipse() +
+  labs(title = 'PCA of Baseline on SNV Normalized Data') +
+  theme_classic()
+```
+
+```{r snv on baseline spectral}
+#Normalization
+snv_on_baseline <- standardNormalVariate(b_normalization)
+#Combine data sets to include Sample ID
+snv_on_baseline <- outliers_removed_data %>%
+  select("SampleID", "Year", "Genotype", "Egg_Parent", "Pollen_Parent") %>%
+  bind_cols(as_tibble(snv_on_baseline))
+#Pivot Table
+snv_on_baseline <- snv_on_baseline %>%
+  pivot_longer(cols = -c(SampleID, Year, Genotype, Egg_Parent, Pollen_Parent),
+               names_to = "Wavelength",
+               values_to = "Absorbance") %>%
+  mutate(Wavelength = as.numeric(Wavelength))
+#Spectral plot
+snv_on_baseline %>%
+  ggplot(aes(x = Wavelength, y = Absorbance, group = SampleID))+
+  geom_line(aes(col=Year))+
+  labs(title = "SNV on Baseline Normalized Data Spectral Plot")+
+  facet_wrap(~Year)+
+  theme_classic()
+```
+
+```{r snv on baseline pca}
+#Pivot to wide format
+snv_on_baseline_wide <- snv_on_baseline %>%
+  pivot_wider(id_cols = c(SampleID, Year, Genotype, Egg_Parent, Pollen_Parent), names_from = Wavelength, values_from = Absorbance)
+snv_on_baseline_wide <- unnest(snv_on_baseline_wide, cols = everything())
+#PCA
+snv_baseline_pca = prcomp(snv_on_baseline_wide[,6:145], scale. = TRUE, center = TRUE)
+#Plot PCA
+snv_on_baseline_wide %>%
+  select(1:5) %>%
+  bind_cols(as_tibble(snv_baseline_pca$x)) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Year)) +
+  geom_point() +
+  stat_ellipse() +
+  labs(title = 'PCA of SNV on Baseline Normalized Data') +
+  theme_classic()
+```
+
+```{r baseline on detrend spectral}
+#Normalization
+baseline_on_detrend <- baseline(d_normalization, wav = as.numeric(colnames(d_normalization)))
+#Combine data sets to include Sample ID
+baseline_on_detrend <- outliers_removed_data %>%
+  select("SampleID", "Year", "Genotype", "Egg_Parent", "Pollen_Parent") %>%
+  bind_cols(as_tibble(baseline_on_detrend))
+#Pivot Table
+baseline_on_detrend <- baseline_on_detrend %>%
+  pivot_longer(cols = -c(SampleID, Year, Genotype, Egg_Parent, Pollen_Parent),
+               names_to = "Wavelength",
+               values_to = "Absorbance") %>%
+  mutate(Wavelength = as.numeric(Wavelength))
+#Spectral plot
+baseline_on_detrend %>%
+  ggplot(aes(x = Wavelength, y = Absorbance, group = SampleID))+
+  geom_line(aes(col=Year))+
+  labs(title = "Baseline on Detrend Normalized Data Spectral Plot")+
+  facet_wrap(~Year)+
+  theme_classic()
+```
+
+```{r baseline on detrend pca}
+#Pivot to wide format
+baseline_on_detrend_wide <- baseline_on_detrend %>%
+  pivot_wider(id_cols = c(SampleID, Year, Genotype, Egg_Parent, Pollen_Parent), names_from = Wavelength, values_from = Absorbance)
+baseline_on_detrend_wide <- unnest(baseline_on_detrend_wide, cols = everything())
+#Check for zero variance
+NZV_baseline_detrend <- nearZeroVar(baseline_on_detrend_wide)
+baseline_on_detrend_wide <- baseline_on_detrend_wide[, -NZV_baseline_detrend]
+#PCA
+baseline_detrend_pca = prcomp(baseline_on_detrend_wide[,6:143], scale. = TRUE, center = TRUE)
+#Plot PCA
+baseline_on_detrend_wide %>%
+  select(1:5) %>%
+  bind_cols(as_tibble(baseline_detrend_pca$x)) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Year)) +
+  geom_point() +
+  stat_ellipse() +
+  labs(title = 'PCA of Baseline on Detrend Normalized Data') +
+  theme_classic()
+```
+
+```{r detrend on baseline spectral}
+#Normalization
+detrend_on_baseline <- detrend(b_normalization, wav = as.numeric(colnames(b_normalization)))
+#Combine data sets to include SampleID
+detrend_on_baseline <- outliers_removed_data %>%
+  select("SampleID", "Year", "Genotype", "Egg_Parent", "Pollen_Parent") %>%
+  bind_cols(as_tibble(detrend_on_baseline))
+#Pivot table
+detrend_on_baseline <- detrend_on_baseline %>%
+  pivot_longer(cols = -c(SampleID, Year, Genotype, Egg_Parent, Pollen_Parent),
+               names_to = "Wavelength",
+               values_to = "Absorbance") %>%
+  mutate(Wavelength = as.numeric(Wavelength))
+#Spectral plot
+detrend_on_baseline %>%
+  ggplot(aes(x = Wavelength, y = Absorbance, group = SampleID))+
+  geom_line(aes(col=Year))+
+  labs(title = "Detrend on Baseline Normalized Data Spectral Plot")+
+  facet_wrap(~Year)+
+  theme_classic()
+```
+
+```{r detrend on baseline pca}
+#Pivot to wide format
+detrend_baseline_wide <- detrend_on_baseline %>%
+  pivot_wider(id_cols = c(SampleID, Year, Genotype, Egg_Parent, Pollen_Parent), names_from = Wavelength, values_from = Absorbance)
+detrend_baseline_wide <- unnest(detrend_baseline_wide, cols = everything())
+#PCA
+detrend_baseline_pca = prcomp(detrend_baseline_wide[,6:145], scale. = TRUE, center = TRUE)
+#Plot PCA
+detrend_baseline_wide %>%
+  select(1:5) %>%
+  bind_cols(as_tibble(detrend_baseline_pca$x)) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Year)) +
+  geom_point() +
+  stat_ellipse() +
+  labs(title = 'PCA of Detrend on Baseline Normalized Data') +
+  theme_classic()
+```
+
+Now that the data is normalized, I can look at which may be the best option going forward. Due to the PCA's of the normalizations being pretty well overlapped by year, there is not one option that seems to be better than the rest. I will attempt to pull spectrally diverse samples out of each dataset and see how normalizations affect the data.
+
+# Honigs Regression
+Honigs pulls samples based on the size of their absorption features. It selects the sample with the highest absorption feature first, subtracts it from the other spectra and the function continues to select samples with the highest absorption
+```{r honigs on outliers removed data}
+#add row number for honigs
+outliers_removed_data <- outliers_removed_data %>%
+  ungroup() %>%
+  mutate(row_num = row_number())
+#reorder data table
+outliers_removed_data <- outliers_removed_data[, c(1:5, ncol(outliers_removed_data), 6:(ncol(outliers_removed_data) - 1))]
+#honigs regression
+honigs_outliers = honigs(outliers_removed_data[,-c(1:6)], k = 60, type = "A")
+honigs_outliers_removed = outliers_removed_data %>%
+  mutate(row_num = row_number(),
+         Group = case_when(row_num %in% honigs_outliers$model ~ 'Train',
+                           row_num %in% honigs_outliers$test ~ 'Test'),
+         .before = '400')
+#create sample selection data table
+sample_selection_outliers <- honigs_outliers_removed %>%
+  filter(Group == 'Train') %>%
+  select(SampleID, Genotype)
+#plot honigs regression spectral plot
+honigs_outliers_removed %>%
+  pivot_longer(cols = -(1:7), names_to = 'Waveband', values_to = 'Absorbance') %>%
+  mutate(Waveband = as.numeric(Waveband),
+         Group = factor(Group, levels = c('Test', 'Train'))) %>%
+  arrange(Group) %>%
+  ggplot(aes(x = Waveband, y = Absorbance, color = Group, group = row_num, alpha = Group)) +
+  geom_line() +
+  scale_color_manual(values = c('red', 'black'), breaks = c('Train', 'Test')) +
+  scale_alpha_manual(values = c(1, 0.3), breaks = c('Train', 'Test'))+
+  labs(title = "Selected Samples from Outliers Dataset") +
+  facet_wrap(~Group) +
+  theme_classic()
+```
+
+```{r pca of honigs outliers}
+#pca for honigs outliers
+pca_honigs_outliers <- prcomp(honigs_outliers_removed[,8:147], center = T, scale. = T)
+#plot PC1 vs PC2
+honigs_outliers_removed %>%
+  select(1:7) %>%
+  bind_cols(as_tibble(pca_honigs_outliers$x)) %>%
+  arrange(Group) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Group)) +
+  geom_point() +
+  scale_color_manual(values = c('red', 'black'), breaks = c('Train', 'Test')) +
+  labs(title = "PCA of Selected Samples from Outliers Removed Data") +
+  theme_classic()
+```
+
+```{r honigs on baseline}
+#row number addition
+baseline_normalization <- baseline_normalization %>%
+  ungroup() %>%
+  mutate(row_num = row_number())
+#reorder data table
+baseline_normalization <- baseline_normalization[, c(1:5, ncol(baseline_normalization), 6:(ncol(baseline_normalization) - 1))]
+#honigs
+honigs_b = honigs(baseline_normalization[,-c(1:6)], k = 60, type = "A")
+honigs_baseline = baseline_normalization %>%
+  mutate(row_num = row_number(),
+         Group = case_when(row_num %in% honigs_b$model ~ 'Train',
+                           row_num %in% honigs_b$test ~ 'Test'),
+         .before = '405') %>%
+  mutate(row_num = as.character(row_num))
+#create sample selection data table
+sample_selection_baseline <- honigs_baseline %>%
+  filter(Group == 'Train') %>%
+  select(SampleID, Genotype)
+#plot honigs baseline
+honigs_baseline %>%
+  pivot_longer(cols = -(1:7), names_to = 'Waveband', values_to = 'Absorbance') %>%
+  mutate(Waveband = as.numeric(Waveband)) %>%
+  arrange(Group) %>%
+  ggplot(aes(x = Waveband, y = Absorbance, color = Group, group = row_num)) +
+  geom_line() +
+  scale_color_manual(values = c('red', 'black'), breaks = c('Train', 'Test')) +
+  labs(title = "Selected Samples from Baseline Dataset") +
+  facet_wrap(~Group)+
+  theme_classic()
+```
+
+```{r honigs baseline pca}
+#pc calculation
+pca_honigs_baseline <- prcomp(honigs_baseline[,8:136], center = T, scale. = T)
+#plot PC1 vs PC2
+honigs_baseline %>%
+  select(1:7) %>%
+  bind_cols(as_tibble(pca_honigs_outliers$x)) %>%
+  arrange(Group) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Group)) +
+  geom_point() +
+  scale_color_manual(values = c('red', 'black'), breaks = c('Train', 'Test')) +
+  labs(title = "PCA of Selected Samples from Baseline Data") +
+  theme_classic()
+```
+
+```{r honigs detrend}
+#add row number column
+detrend_normalization <- detrend_normalization %>%
+  ungroup() %>%
+  mutate(row_num = row_number())
+#reorder data table
+detrend_normalization <- detrend_normalization[, c(1:5, ncol(detrend_normalization), 6:(ncol(detrend_normalization) - 1))]
+#honigs regression
+honigs_d = honigs(detrend_normalization[,-c(1:6)], k = 60, type = "A")
+honigs_detrend = detrend_normalization %>%
+  mutate(row_num = row_number(),
+         Group = case_when(row_num %in% honigs_d$model ~ 'Train',
+                           row_num %in% honigs_d$test ~ 'Test'),
+         .before = '400') %>%
+  mutate(row_num = as.character(row_num))
+#sample selection
+sample_selection_detrend <- honigs_detrend %>%
+  filter(Group == 'Train') %>%
+  select(SampleID, Genotype)
+#plot spectral
+honigs_detrend %>%
+  pivot_longer(cols = -(1:7), names_to = 'Waveband', values_to = 'Absorbance') %>%
+  mutate(Waveband = as.numeric(Waveband)) %>%
+  arrange(Group) %>%
+  ggplot(aes(x = Waveband, y = Absorbance, color = Group, group = row_num)) +
+  geom_line() +
+  scale_color_manual(values = c('red', 'black'), breaks = c('Train', 'Test')) +
+  labs(title = "Selected Samples from Detrend Dataset") +
+  facet_wrap(~Group)+
+  theme_classic()
+```
+
+```{r pca honigs detrend}
+#pca calculation
+pca_honigs_detrend <- prcomp(honigs_detrend[,8:147], center = T, scale. = T)
+#plot PC1 vs PC2
+honigs_detrend %>%
+  select(1:7) %>%
+  bind_cols(as_tibble(pca_honigs_detrend$x)) %>%
+  arrange(Group) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Group)) +
+  geom_point() +
+  scale_color_manual(values = c('red', 'black'), breaks = c('Train', 'Test')) +
+  labs(title = "PCA of Selected Samples from Detrend Data") +
+  theme_classic()
+```
+
+```{r honigs snv}
+#row number addition
+snv_normalization <- snv_normalization %>%
+  ungroup() %>%
+  mutate(row_num = row_number())
+#reorder data table
+snv_normalization <- snv_normalization[, c(1:5, ncol(snv_normalization), 6:(ncol(snv_normalization) - 1))]
+#honigs regression, pulling 75 samples because we are using this for sample selection
+honigs_s = honigs(snv_normalization[,-c(1:6)], k = 60, type = "A")
+honigs_snv = snv_normalization %>%
+  mutate(row_num = row_number(),
+         Group = case_when(row_num %in% honigs_s$model ~ 'Train',
+                           row_num %in% honigs_s$test ~ 'Test'),
+         .before = '400') %>%
+  mutate(row_num = as.character(row_num))
+#create data table
+sample_selection_snv <- honigs_snv %>%
+  slice(honigs_s$model) %>%
+  filter(Group == 'Train') %>%
+  select(SampleID, Genotype)
+#plot spectral
+honigs_snv %>%
+  pivot_longer(cols = -(1:7), names_to = 'Waveband', values_to = 'Absorbance') %>%
+  mutate(Waveband = as.numeric(Waveband)) %>%
+  arrange(desc(Group)) %>%
+  ggplot(aes(x = Waveband, y = Absorbance, color = Group, group = row_num)) +
+  geom_line() +
+  scale_color_manual(values = c('red', 'black'), breaks = c('Train', 'Test')) +
+  labs(title = "Selected Samples from SNV Dataset") +
+  facet_wrap(~Group)+
+  theme_classic()
+```
+
+```{r pca on snv}
+#calculate PC
+pca_honigs_snv <- prcomp(honigs_snv[,8:147], center = T, scale. = T)
+#PC1 vs PC2
+honigs_snv %>%
+  select(1:7) %>%
+  bind_cols(as_tibble(pca_honigs_snv$x)) %>%
+  arrange(Group) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Group)) +
+  geom_point() +
+  scale_color_manual(values = c('red', 'black'), breaks = c('Train', 'Test')) +
+  labs(title = "PCA of Selected Samples from SNV Data") +
+  theme_classic()
+```
+
+#SNV seems to give the best distribution of samples within the PC, so we will be using that for sample selection, but will calculate the other options as well.
+```{r baseline on snv honigs}
+#add row number
+baseline_on_snv_wide <- baseline_on_snv_wide %>%
+  ungroup() %>%
+  mutate(row_num = row_number())
+#reorder data table
+baseline_on_snv_wide <- baseline_on_snv_wide[, c(1:5, ncol(baseline_on_snv_wide), 6:(ncol(baseline_on_snv_wide) - 1))]
+#honigs regression
+honigs_b_s = honigs(baseline_on_snv_wide[,-c(1:6)], k = 60, type = "A")
+honigs_baseline_snv = baseline_on_snv_wide %>%
+  mutate(row_num = row_number(),
+         Group = case_when(row_num %in% honigs_b_s$model ~ 'Train',
+                           row_num %in% honigs_b_s$test ~ 'Test'),
+         .before = '405') %>%
+  mutate(row_num = as.character(row_num))
+#sample selection data table
+sample_selection_baseline_snv <- honigs_baseline_snv %>%
+  filter(Group == 'Train') %>%
+  select(SampleID, Genotype)
+#plot honigs
+honigs_baseline_snv %>%
+  pivot_longer(cols = -(1:7), names_to = 'Waveband', values_to = 'Absorbance') %>%
+  mutate(Waveband = as.numeric(Waveband)) %>%
+  arrange(Group) %>%
+  ggplot(aes(x = Waveband, y = Absorbance, color = Group, group = row_num)) +
+  geom_line() +
+  scale_color_manual(values = c('red', 'black'), breaks = c('Train', 'Test')) +
+  labs(title = "Selected Samples from Baseline on SNV Dataset") +
+  facet_wrap(~Group)+
+  theme_classic()
+```
+
+```{r honigs pca on baseline-snv}
+#pca calculation
+pca_honigs_baseline_snv <- prcomp(honigs_baseline_snv[,8:136], center = T, scale. = T)
+#plot PC1 vs PC2
+honigs_baseline_snv %>%
+  select(1:7) %>%
+  bind_cols(as_tibble(pca_honigs_baseline_snv$x)) %>%
+  arrange(Group) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Group)) +
+  geom_point() +
+  scale_color_manual(values = c('red', 'black'), breaks = c('Train', 'Test')) +
+  labs(title = "PCA of Selected Samples from Baseline on SNV Data") +
+  theme_classic()
+```
+
+```{r snv on baseline honigs}
+#add row number
+snv_on_baseline_wide <- snv_on_baseline_wide %>%
+  ungroup() %>%
+  mutate(row_num = row_number())
+#reorder data table
+snv_on_baseline_wide <- snv_on_baseline_wide[, c(1:5, ncol(snv_on_baseline_wide), 6:(ncol(snv_on_baseline_wide) - 1))]
+#honigs regression
+honigs_s_b = honigs(snv_on_baseline_wide[,-c(1:6)], k = 60, type = "A")
+honigs_snv_baseline = snv_on_baseline_wide %>%
+  mutate(row_num = row_number(),
+         Group = case_when(row_num %in% honigs_s_b$model ~ 'Train',
+                           row_num %in% honigs_s_b$test ~ 'Test'),
+         .before = '400') %>%
+  mutate(row_num = as.character(row_num))
+#sample selection data table
+sample_selection_snv_baseline <- honigs_snv_baseline %>%
+  filter(Group == 'Train') %>%
+  select(SampleID, Genotype)
+#plot spectral data
+honigs_snv_baseline %>%
+  pivot_longer(cols = -(1:7), names_to = 'Waveband', values_to = 'Absorbance') %>%
+  mutate(Waveband = as.numeric(Waveband)) %>%
+  arrange(Group) %>%
+  ggplot(aes(x = Waveband, y = Absorbance, color = Group, group = row_num)) +
+  geom_line() +
+  scale_color_manual(values = c('red', 'black'), breaks = c('Train', 'Test')) +
+  labs(title = "Selected Samples from SNV on Baseline Dataset") +
+  facet_wrap(~Group)+
+  theme_classic()
+```
+
+```{r pca snv on baseline}
+#pca calculation
+pca_honigs_snv_baseline <- prcomp(honigs_snv_baseline[,8:147], center = T, scale. = T)
+#plot PC1 vs PC2
+honigs_snv_baseline %>%
+  select(1:7) %>%
+  bind_cols(as_tibble(pca_honigs_snv_baseline$x)) %>%
+  arrange(Group) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Group)) +
+  geom_point() +
+  scale_color_manual(values = c('red', 'black'), breaks = c('Train', 'Test')) +
+  labs(title = "PCA of Selected Samples from SNV on Baseline Data") +
+  theme_classic()
+```
+
+```{r honigs baseline on detrend}
+#add row number
+baseline_on_detrend_wide <- baseline_on_detrend_wide %>%
+  ungroup() %>%
+  mutate(row_num = row_number())
+#reorder data table
+baseline_on_detrend_wide <- baseline_on_detrend_wide[, c(1:5, ncol(baseline_on_detrend_wide), 6:(ncol(baseline_on_detrend_wide) - 1))]
+#honigs regression
+honigs_b_d = honigs(baseline_on_detrend_wide[,-c(1:6)], k = 60, type = "A")
+honigs_baseline_on_detrend = baseline_on_detrend_wide %>%
+  mutate(row_num = row_number(),
+         Group = case_when(row_num %in% honigs_b_d$model ~ 'Train',
+                           row_num %in% honigs_b_d$test ~ 'Test'),
+         .before = '405') %>%
+  mutate(row_num = as.character(row_num))
+#sample selection data table
+sample_selection_baseline_detrend <- honigs_baseline_on_detrend %>%
+  filter(Group == 'Train') %>%
+  select(SampleID, Genotype)
+#plot spectral
+honigs_baseline_on_detrend %>%
+  pivot_longer(cols = -(1:7), names_to = 'Waveband', values_to = 'Absorbance') %>%
+  mutate(Waveband = as.numeric(Waveband)) %>%
+  arrange(Group) %>%
+  ggplot(aes(x = Waveband, y = Absorbance, color = Group, group = row_num)) +
+  geom_line() +
+  scale_color_manual(values = c('red', 'black'), breaks = c('Train', 'Test')) +
+  labs(title = "Selected Samples from Baseline on Detrend Dataset") +
+  facet_wrap(~Group)+
+  theme_classic()
+```
+
+```{r baseline on detrend pca honigs}
+#calculate PC
+pca_honigs_baseline_detrend <- prcomp(honigs_baseline_on_detrend[,8:145], center = T, scale. = T)
+#plot PC1 vs PC2
+honigs_baseline_on_detrend %>%
+  select(1:7) %>%
+  bind_cols(as_tibble(pca_honigs_baseline_detrend$x)) %>%
+  arrange(Group) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Group)) +
+  geom_point() +
+  scale_color_manual(values = c('red', 'black'), breaks = c('Train', 'Test')) +
+  labs(title = "PCA of Selected Samples from Baseline on Detrend Data") +
+  theme_classic()
+```
+
+#Now that we have calculated all of the honigs regression and come up with a list of samples for cooking, I'd like to compare all of the sample selection data tables together to see if there is any overlap between the different normalization methods.
+```{r honigs upset plot}
+#packages for UpSetR
+library(UpSetR)
+library(data.table)
+#create big data table containing all sample selections
+selected_samples_list <- data.table(
+  sample_selection_baseline,
+  sample_selection_baseline_detrend,
+  sample_selection_baseline_snv,
+  sample_selection_detrend,
+  sample_selection_outliers,
+  sample_selection_snv,
+  sample_selection_snv_baseline
+)
+#change column names
+colnames(selected_samples_list) <- c("Baseline", "Genotype_Baseline", "Baseline-Detrend", "Genotype_Baseline-Detrend", "Baseline-SNV", "Genotype_Baseline-SNV", "Detrend", "Genotype_Detrend", "Outliers", "Genotype_Outliers", "SNV", "Genotype_SNV", "SNV-Baseline", "Genotype_SNV-Baseline")
+#create list to pull from
+fld <- fromList(as.list(selected_samples_list))
+upset(fld, nsets=14, matrix.color = "lightblue")
+```
+
+There is not a single sample or genotype that is the exact same between all of the samples selected and the genotypes correlated to them. This means that each group was very different from each other. We will move forward with SNV-Normalization. Upon examining the sample selection, we found that there was overlap of genotypes, specifically the egg parent. To fix this, we will be using a 'for loop' to remove all samples pertaining to an egg parent once it has been selected, so that all samples selected are spectrally diverse and have different egg parents.
+
+```{r honigs snv removing genotypes}
+#Modifying copy of snv_normalization data frame
+copied_snv_normalization <- snv_normalization[snv_normalization$Pollen_Parent %in% c('B73', 'Mo17', 'LH244'),]
+#copied_snv_normalization_sub = copied_snv_normalization
+#this needs to be run with each modification of the loop
+sample_selection_good = tibble()
+#for loop to select spectrally diverse samples that do not have the same egg parent as any other sample selected
+for(year in c('22', '23')){
+  copied_snv_normalization_sub <- copied_snv_normalization[copied_snv_normalization$Year == year,]
+  for (i in 1:40) {
+    print(paste('---', i, '---'))
+    result <- honigs(copied_snv_normalization_sub[,-c(1:6)], k = i+1, type = "A")
+    #print(copied_snv_normalization_sub[result$model[1:i],]$SampleID)
+    egg_parent <- copied_snv_normalization_sub[result$model[i], c(1,4)]
+    sample_selection_good <- bind_rows(sample_selection_good, egg_parent)
+    copied_snv_normalization <- copied_snv_normalization[copied_snv_normalization$Egg_Parent != egg_parent$Egg_Parent | copied_snv_normalization$SampleID == egg_parent$SampleID,]
+    # print(sample_selection_good$`SampleID`)
+    # if(i ==3){
+    #   break
+    # }
+  }
+}
+#make new file for spectral plot
+honigs_snv_good = snv_normalization %>%
+  mutate(Group = case_when(SampleID %in% sample_selection_good$SampleID ~ 'Train',
+                           !SampleID %in% sample_selection_good$SampleID ~ 'Test'),
+         .before = '400') %>%
+  mutate(row_num = as.character(row_num))
+
+honigs_snv_good %>%
+  filter(Group == 'Train') %>%
+  group_by(Year) %>%
+  summarise(n = n())
+
+honigs_snv_good %>%
+  filter(Group == 'Train') %>%
+  group_by(Pollen_Parent) %>%
+  summarise(n = n())
+
+honigs_snv_good %>%
+  filter(Group == 'Train') %>%
+  group_by(Year, Pollen_Parent) %>%
+  summarise(n = n())
+```
+
+```{r plot new honigs snv}
+honigs_snv_good %>%
+  pivot_longer(cols = -(1:7), names_to = 'Waveband', values_to = 'Absorbance') %>%
+  mutate(Waveband = as.numeric(Waveband)) %>%
+  arrange(Group) %>%
+  ggplot(aes(x = Waveband, y = Absorbance, color = Group, group = row_num)) +
+  geom_line() +
+  scale_color_manual(values = c('red', 'black'), breaks = c('Train', 'Test')) +
+  labs(title = "Selected Samples from Final SNV Sample Selection") +
+  facet_wrap(~Group) +
+  theme_classic()
+```
+
+```{r pca for final snv sample selection}
+#calculate PC
+pca_honigs_snv_final <- prcomp(honigs_snv_good[,8:147], center = T, scale. = T)
+#plot PC1 vs PC2
+honigs_snv_good %>%
+  select(1:7) %>%
+  bind_cols(as_tibble(pca_honigs_snv_final$x)) %>%
+  arrange(Group) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Group, shape = Year)) +
+  geom_point() +
+  scale_color_manual(values = c('red', 'black'), breaks = c('Train', 'Test')) +
+  labs(title = "PCA of Final Sample Selection") +
+  theme_classic()
+```
+
+Now that we have successfully identified all of the samples we will use for the cook validation, I will export the final sample selection as a .csv file.
+```{r export csv file}
+#add full genotype information
+sample_selection_good <- left_join(sample_selection_good, genotypes_data, join_by(SampleID == Plot))
+#export as .csv file
+write.csv(x = sample_selection_good, "/Users/sydneyberry/Downloads/Independent Research Project/FOSS NIR/R Code/sample_selection_final.csv")
+```
+
