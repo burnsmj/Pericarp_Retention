@@ -1,5 +1,6 @@
 ---
 title: "Foss_NIR_Data"
+author: "Sydney Berry"
 output: html_document
 date: "2024-02-21"
 ---
@@ -808,20 +809,31 @@ copied_snv_normalization <- snv_normalization[snv_normalization$Pollen_Parent %i
 sample_selection_good = tibble()
 #for loop to select spectrally diverse samples that do not have the same egg parent as any other sample selected
 for(year in c('22', '23')){
-  copied_snv_normalization_sub <- copied_snv_normalization[copied_snv_normalization$Year == year,]
-  for (i in 1:40) {
-    print(paste('---', i, '---'))
-    result <- honigs(copied_snv_normalization_sub[,-c(1:6)], k = i+1, type = "A")
-    #print(copied_snv_normalization_sub[result$model[1:i],]$SampleID)
-    egg_parent <- copied_snv_normalization_sub[result$model[i], c(1,4)]
-    sample_selection_good <- bind_rows(sample_selection_good, egg_parent)
-    copied_snv_normalization <- copied_snv_normalization[copied_snv_normalization$Egg_Parent != egg_parent$Egg_Parent | copied_snv_normalization$SampleID == egg_parent$SampleID,]
-    # print(sample_selection_good$`SampleID`)
-    # if(i ==3){
-    #   break
-    # }
+  pollen_parents = unique(copied_snv_normalization$Pollen_Parent[copied_snv_normalization$Year == year])
+  
+  for(p in pollen_parents){
+
+    for (i in 1:20) {
+      print(paste('---', i, '---'))
+      copied_snv_normalization_sub <- copied_snv_normalization[copied_snv_normalization$Year == year &
+                                                                 copied_snv_normalization$Pollen_Parent == p,]
+
+      
+      result <- honigs(copied_snv_normalization_sub[,-c(1:6)], k = i+1, type = "A")
+      
+      #print(copied_snv_normalization_sub[result$model[1:i],]$SampleID)
+      
+      egg_parent <- copied_snv_normalization_sub[result$model[i], c(1,4,5)]
+      
+      sample_selection_good <- bind_rows(sample_selection_good, egg_parent)
+      
+      copied_snv_normalization <- copied_snv_normalization[copied_snv_normalization$Egg_Parent != egg_parent$Egg_Parent | copied_snv_normalization$SampleID == egg_parent$SampleID,]
+    }
   }
 }
+
+length(unique(sample_selection_good$SampleID))
+
 #make new file for spectral plot
 honigs_snv_good = snv_normalization %>%
   mutate(Group = case_when(SampleID %in% sample_selection_good$SampleID ~ 'Train',
@@ -878,6 +890,99 @@ Now that we have successfully identified all of the samples we will use for the 
 #add full genotype information
 sample_selection_good <- left_join(sample_selection_good, genotypes_data, join_by(SampleID == Plot))
 #export as .csv file
-write.csv(x = sample_selection_good, "/Users/sydneyberry/Downloads/Independent Research Project/FOSS NIR/R Code/sample_selection_final.csv")
+sample_selection_good %>%
+  write_csv("~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/methodology_validation_samples2find.csv")
+```
+
+```{r read in found validation samples}
+samples = read_csv('~/Downloads/Pericarp Methods Validation Samples to Find - Sheet1.csv') %>%
+  filter(Found == 1) %>%
+  select(SampleID)
+```
+
+```{r create benchtop cook test labels}
+set.seed(1234)
+# Make labels for cook test packaging
+sample_labels = samples %>%
+   mutate(A = NA,
+          B = NA) %>%
+   pivot_longer(cols = c(A, B),
+                names_to = 'Hotplate_ID') %>%
+   select(-value) %>%
+   sample_frac(1) %>%
+   group_by(Hotplate_ID) %>%
+   mutate(Hotplate_Pos = rep_len(c(1:4), n())) %>%
+   group_by(Hotplate_ID, Hotplate_Pos) %>%
+   mutate(Cook_Day = row_number()) %>%
+   arrange(Cook_Day, Hotplate_ID, Hotplate_Pos)
+
+# Write labels for packaging
+# sample_labels %>%
+#     write_csv('/Users/michael/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/Pericarp_Validation_Samples.csv')
+
+# Create a write labels for subsamples
+sample_labels %>%
+   mutate(Pericarp_1 = NA,
+          Pericarp_2 = NA,
+          Kernels_1 = NA,
+          Kernels_2 = NA) %>%
+   pivot_longer(cols = c(Pericarp_1, Pericarp_2, Kernels_1, Kernels_2),
+                names_to = 'Subsample') %>%
+   select(-value) #%>%
+   #write_csv('/Users/michael/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/Pericarp_Validation_Subsamples.csv')
+```
+
+```{r initial pericarp labels}
+set.seed(12345)
+initial_value_samples = samples %>%
+  mutate(A = NA,
+         B = NA) %>%
+  pivot_longer(cols = c(A, B),
+              names_to = 'Replicate') %>%
+  select(-value) %>%
+  sample_frac(1) %>%
+  mutate(order = row_number()) %>%
+  arrange(SampleID)
+
+initial_value_samples #%>%
+  #write_csv('/Users/michael/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/Pericarp_Validation_Initial_Pericarp_Labels.csv')
+
+
+initial_value_samples %>%
+   mutate(Pericarp_1 = NA,
+          Pericarp_2 = NA) %>%
+   pivot_longer(cols = c(Pericarp_1, Pericarp_2),
+                names_to = 'Subsample') %>%
+   select(-value) %>%
+  arrange(order, Subsample)# %>%
+  # write_csv('/Users/michael/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/Pericarp_Validation_Initial_Pericarp_Subsample_Labels.csv')
+```
+
+```{r rapid cook test labels}
+set.seed(123456)
+rapid_samples = samples %>%
+  mutate(A = NA,
+         B = NA) %>%
+  pivot_longer(cols = c(A, B),
+              names_to = 'Replicate') %>%
+  select(-value) %>%
+  sample_frac(1) %>%
+  mutate(day = rep_len(c(1:4), n())) %>%
+  arrange(SampleID)
+
+rapid_samples %>%
+  write_csv('/Users/michael/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/Pericarp_Validation_Rapid_Pericarp_Labels.csv')
+
+
+rapid_samples %>%
+   mutate(Pericarp_1 = NA,
+          Pericarp_2 = NA,
+          Kernels_1 = NA,
+          Kernels_2 = NA) %>%
+   pivot_longer(cols = c(Pericarp_1, Pericarp_2, Kernels_1, Kernels_2),
+                names_to = 'Subsample') %>%
+   select(-value) %>%
+  arrange(day, Replicate) %>%
+  write_csv('/Users/michael/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/Pericarp_Validation_Rapid_Pericarp_Subsample_Labels.csv')
 ```
 

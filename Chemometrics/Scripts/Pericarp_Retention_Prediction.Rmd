@@ -1,0 +1,2811 @@
+---
+title: "Pericarp Retention Prediction"
+author: "Michael Burns"
+date: '2024-06-20'
+output: 
+  html_document:
+      code_folding: hide
+      toc: yes
+      toc_float: True
+      toc_depth: 3
+      fig_retina: 2
+      number_sections: FALSE
+      highlight: pygments
+      theme: spacelab
+---
+
+# Purpose
+To evaluate the efficacy of proxy values for measuring pericarp retention in diverse maize hybrids. The goal of this is to select 60 diverse hybrids (12 from each year-pollen parent combination) and measure the pericarp retained in benchtop cook tests (gold standard) as well as the rapid cook test (proposed by Serna-Saldivar et al. 1991). We will also take images of the kernels before the cooking process incase shape charactersitics seem important, and take images of stained kernels following benchtop and rapid cooks to score following the Serna-Saldivar et al. (1991) method. We will also measure the initial pericarp quantity, kernel mass, kernel volume, and kernel density.
+
+Pericarp retention is defined as the mass (mg) of pericarp retained for every gram of pericarpless-kernel. This is used as the definition as 10 kernel pericarp content is not going to be consistent across samples of varying kernel size/pericarp thickness and the metric is scalable to larger quantities of kernels that might be seen in a manufacturing facility.
+
+# Libraries
+We should only need tidyverse for data wrangling and analysis and lme4 for mixed linear modeling.
+
+```{r libraries, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(lme4)
+library(caret)
+library(outliers)
+library(magrittr)
+library(ggExtra)
+library(GGally)
+```
+
+# Read in Data
+To complete this analysis we will need the compositional data from the FOSS NIR to ensure that the samples chosen are compositionally diverse, the spectral data from the FOSS NIR to ensure the samples chosen are spectrally diverse, the list of samples that were chosen in Sydney's analysis, and a cross reference file to incorporate genotype information.
+```{r read in data, message = FALSE, warning = FALSE}
+# Composition data
+ych_perten_comp = read_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/YCH_Perten_Composition.csv') %>%
+  filter(str_detect(Sample_ID, '^YCH')) %>%
+  mutate(Protein = Protein / (1 - (Moisture / 100)),
+         Starch = Starch / (1 - (Moisture / 100)),
+         Fiber = Fiber / (1 - (Moisture / 100)),
+         Fat = Fat / (1 - (Moisture / 100)),
+         Ash = Ash / (1 - (Moisture / 100))) %>%
+  select(-Moisture)
+
+ych_foss_comp = read_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/ych22_ych23_foss_comp_repred.csv') %>%
+  rename(Sample_ID = `Sample Number`,
+         Density = `Corn Density CNDE0001 STM`,
+         Oil = `Corn Oil CNOI0005 STM`,
+         Protein = `Corn Protein CNPR0005 STM`,
+         Starch = `Corn Starch CNST0006 STM`) %>%
+  mutate(Sample_ID = toupper(Sample_ID),
+         Sample_ID = str_replace(Sample_ID, '-', ':')) %>%
+  filter(!is.na(Sample_ID),
+         str_detect(Sample_ID, '^YCH')) %>%
+  select(Sample_ID, Protein, Starch, Oil, Density)
+  
+
+# Spectral data
+ych_foss_spec = read_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/YCH22_YCH23_FOSS_Spectra.csv')
+
+# List of initial validation samples
+init_val_samples = read_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/Pericarp_Initial_Validation_Samples.csv')
+
+# Cross reference to attach genotypes to sample ID's
+genotype_xref = read_csv("~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/YCH_Plot_2_Genotype.csv")
+```
+
+# Data Cleaning
+The data we will be using for the first part of this analysis is spectral and compositional data directly from the FOSS Infratec NOVA. These predictions come from scans of samples on a 29mm pathlength in a sample transport module cuvette.
+
+## Composition Data
+While we do not have the highest confidence in the compositional predictions, we are choosing to move forward with them as they should be consistent enough across samples to verify that samples are spanning compositional variation. We will remove samples that are not YCH samples, are missing data, and are duplicates. We will also select for just the sample ID and the compositional attributes (protein, starch, fiber, and fat).
+
+```{r data cleaning - composition, message = FALSE, warning = FALSE}
+ych_perten_comp = ych_perten_comp %>%
+  select(Sample_ID, Protein, Starch, Fat, Fiber, Ash) %>% # Note: composition data is already moisture corrected
+  mutate(Sample_ID = toupper(Sample_ID),
+         Sample_ID = str_replace(Sample_ID, '-', ':')) %>%
+  filter(!is.na(Sample_ID),
+         str_detect(Sample_ID, '^YCH')) %>%
+  left_join(genotype_xref, by = c('Sample_ID' = 'Plot')) %>%
+  filter(!is.na(Genotype),
+         !is.na(Protein)) %>% # remove samples with missing compositional values
+  mutate(Sample_ID = str_extract(Sample_ID, '^YCH2[2-4]:[1-2][0-8][0-9][0-9]'),
+         row = row_number()) %>%
+  arrange(desc(row)) %>%
+  distinct(Sample_ID, .keep_all = TRUE, ) %>%
+  arrange(row) %>%
+  select(Sample_ID, Genotype, Protein, Starch, Fat, Fiber, Ash)
+```
+
+## Spectral Data
+We also have spectra data that is in a strange transposed format which we need to correct for. To make the processing faster we selected every 5th waveband from 400 to 1095 (400, 405, etc.). We again select for samples that are YCH, have all of the necessary data, and are not duplicates.
+
+```{r data cleaning - spectral, message = FALSE, warning = FALSE}
+ych_foss_spec = ych_foss_spec %>%
+  slice(-c(1)) %>%
+  rename(Wavelength = `...1`) %>% 
+  filter(as.numeric(Wavelength) %% 5 == 0) %>%
+  pivot_longer(cols = -Wavelength,
+               names_to = 'Sample_ID',
+               values_to = 'Absorbance') %>%
+  mutate(Wavelength = as.numeric(Wavelength),
+         Absorbance = as.numeric(Absorbance),
+         Sample_ID = str_remove(Sample_ID, '^sample no: ')) %>%
+  pivot_wider(id_cols = Sample_ID,
+              names_from = Wavelength,
+              values_from = Absorbance) %>%
+  mutate(Sample_ID = toupper(Sample_ID),
+         Sample_ID = str_replace(Sample_ID, '-', ':')) %>%
+  filter(!is.na(Sample_ID),
+         str_detect(Sample_ID, '^YCH')) %>%
+  mutate(Sample_ID = str_extract(Sample_ID, '^YCH2[2-4]:[1-2][0-8][0-9][0-9]'),
+         row = row_number()) %>%
+  arrange(desc(row)) %>%
+  distinct(Sample_ID, .keep_all = TRUE, ) %>%
+  arrange(row) %>%
+  left_join(genotype_xref, by = c('Sample_ID' = 'Plot')) %>%
+  filter(!is.na(Genotype),
+         !is.na(`400`)) %>% # remove samples with missing compositional values
+  select(Sample_ID, Genotype, as.character(seq(400, 1095, 5)))
+```
+
+# Visualize Data
+## Compositional Distributions
+```{r compositional distributions, message = FALSE, warning = FALSE}
+ych_perten_comp %>%
+  pivot_longer(cols = c(Protein, Starch, Fat, Fiber, Ash),
+               names_to = 'Component',
+               values_to = 'Value') %>%
+  ggplot(aes(x = Value)) +
+  geom_density() +
+  facet_wrap(~Component, scales = 'free') +
+  theme_classic()
+
+ych_foss_comp %>%
+  pivot_longer(cols = c(Protein, Starch, Oil, Density),
+               names_to = 'Component',
+               values_to = 'Value') %>%
+  ggplot(aes(x = Value)) +
+  geom_density() +
+  facet_wrap(~Component, scales = 'free') +
+  theme_classic()
+```
+
+The compositional distributions look roughly normal, though starch is a little left skewed and oil is a little right skewed. Protein and moisture look roughly normal. All values provided seem within a natural range.
+
+## Spectral Profiles
+```{r spectral profiles, message = FALSE, warning = FALSE}
+ych_foss_spec %>%
+  pivot_longer(cols = -c(Sample_ID, Genotype),
+               names_to = 'Wavelength',
+               values_to = 'Absorbance') %>%
+  ggplot(aes(x = as.numeric(Wavelength), y = Absorbance, group = Sample_ID)) +
+  geom_line() +
+  labs(x = 'Waveband')+
+  theme_classic()
+```
+
+The spectra mostly has the shape expected, though there are a handful of samples that appear to be outliers. Hopefully these samples are not the ones that were chosen for validation of the methods.
+
+## Principal Component Analysis of Spectral Data
+```{r pca of spectral data, message = FALSE, warning = FALSE}
+pca <- prcomp(ych_foss_spec[,-c(1,2)], center = TRUE, scale. = TRUE)
+
+pca$x %>%
+  as_tibble() %>%
+  ggplot(aes(x = PC1, y = PC2)) +
+  geom_point() +
+  theme_classic()
+```
+
+The spectral PCA plot confirms the exisistence of outliers.  We will remove spectral outliers with the mahalanobis distance.
+
+# Remove Spectral Outliers
+```{r mahalanobis distance for outlier removal, message = FALSE, warning = FALSE}
+#waveband matrix
+wavebands <- (seq(400, 1095, 5))
+#calculate the mahalanobis distance
+m_dist <- as.matrix(mahalanobis(ych_foss_spec[,colnames(ych_foss_spec) %in% wavebands],                                colMeans(ych_foss_spec[,colnames(ych_foss_spec) %in% wavebands]),
+                    cov(ych_foss_spec[,colnames(ych_foss_spec) %in% wavebands]), na.rm=TRUE))
+#appends Mdist to ych_foss_spec
+ych_foss_spec$Mdist = round(m_dist, 1)
+#create data frame without outliers
+ych_foss_spec_clean <- ych_foss_spec %>%
+  mutate(MThresh = 3 * mean(Mdist)) %>%
+  filter(Mdist < MThresh) %>%
+  select(-Mdist,
+         -MThresh) #this removed 65 samples
+```
+
+## Plot Data Again
+```{r plot data again, message = FALSE, warning = FALSE}
+# Spectral Profiles
+ych_foss_spec_clean %>%
+  pivot_longer(cols = -c(Sample_ID, Genotype),
+               names_to = 'Wavelength',
+               values_to = 'Absorbance') %>%
+  ggplot(aes(x = as.numeric(Wavelength), y = Absorbance, group = Sample_ID)) +
+  geom_line() +
+  labs(x = 'Waveband')+
+  theme_classic()
+
+# PCA
+pca_clean <- prcomp(ych_foss_spec_clean[,-c(1,2)], center = TRUE, scale. = TRUE)
+
+pca_clean$x %>%
+  as_tibble() %>%
+  ggplot(aes(x = PC1, y = PC2)) +
+  geom_point() +
+  theme_classic()
+```
+
+This looks much better. The spectral outliers have been removed (though we should double check what these samples are in the future if they are not selected samples so we can understand why they are outliers).
+
+## Create a Clean Version of Composition Data
+```{r clean composition data, message = FALSE, warning = FALSE}
+ych_perten_comp_clean = ych_perten_comp %>%
+  filter(Sample_ID %in% ych_foss_spec_clean$Sample_ID)
+
+ych_foss_comp_clean = ych_foss_comp %>%
+  filter(Sample_ID %in% ych_foss_spec_clean$Sample_ID)
+```
+
+## Plot the Clean Composition Data
+```{r plot clean composition data, message = FALSE, warning = FALSE}
+ych_perten_comp_clean %>%
+  pivot_longer(cols = c(Protein, Starch, Fat, Fiber, Ash),
+               names_to = 'Component',
+               values_to = 'Value') %>%
+  ggplot(aes(x = Value)) +
+  geom_density() +
+  facet_wrap(~Component, scales = 'free') +
+  theme_classic()
+
+ych_foss_comp_clean %>%
+  pivot_longer(cols = c(Protein, Starch, Oil, Density),
+               names_to = 'Component',
+               values_to = 'Value') %>%
+  ggplot(aes(x = Value)) +
+  geom_density() +
+  facet_wrap(~Component, scales = 'free') +
+  theme_classic()
+```
+
+The cleaning process really helped the data from both a spectral and a compositional standpoint. The spectral data looks much more consistent and the compositional data looks much more normal.
+
+# Plot out the spectra and composition of samples
+## Spectra and PCA
+```{r plot initial validation samples, message = FALSE, warning = FALSE}
+# Spectra
+ych_foss_spec_clean %>%
+  mutate(val_sample = case_when(Sample_ID %in% init_val_samples$Sample_ID ~ 'Validation',
+                                !Sample_ID %in% init_val_samples$Sample_ID ~ 'Not Validation')) %>%
+  pivot_longer(cols = -c(Sample_ID, Genotype, val_sample),
+               names_to = 'Wavelength',
+               values_to = 'Absorbance') %>%
+  ggplot(aes(x = as.numeric(Wavelength), y = Absorbance, group = Sample_ID, color = val_sample)) +
+  geom_line() +
+  labs(x = 'Waveband')+
+  scale_color_manual(values = c('Validation' = 'black', 'Not Validation' = 'gray')) +
+  facet_wrap(~val_sample) +
+  theme_classic()
+
+# PCA
+val_sample_pca_plot = ych_foss_spec_clean %>%
+  select(Sample_ID) %>%
+  bind_cols(pca_clean$x[,c(1,2)] %>%
+              as_tibble()) %>%
+  mutate(val_sample = case_when(Sample_ID %in% init_val_samples$Sample_ID ~ 'Validation',
+                                !Sample_ID %in% init_val_samples$Sample_ID ~ 'Not Validation')) %>%
+  arrange(val_sample) %>%
+  ggplot(aes(x = PC1, y = PC2, color = val_sample)) +
+  geom_point(show.legend = F) +
+  labs(x = paste0('PC1', ' (', round(summary(pca_clean)$importance[2], 2), '%)'),
+       y = paste0('PC2', ' (', round(summary(pca_clean)$importance[5], 2), '%)'),
+       tag = 'A') +
+  scale_color_manual(values = c('Validation' = 'black', 'Not Validation' = 'gray')) +
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'))
+
+val_sample_pca_plot
+
+ggsave('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/val_sample_pca_plot.png',
+       plot = val_sample_pca_plot,
+       width = 3.75,
+       height = 3,
+       dpi = 300)
+
+```
+
+The spectral appears to be relatively well represented (I would like to see more on the high and low ends of PC1, but overall this is pretty good representation).
+
+## Composition
+```{r composition of initial validation samples, message = FALSE, warning = FALSE}
+composition_plots = ych_perten_comp_clean %>%
+  mutate(Group = case_when(Sample_ID %in% init_val_samples$Sample_ID ~ 'Validation',
+                                !Sample_ID %in% init_val_samples$Sample_ID ~ 'Not Validation')) %>%
+  pivot_longer(cols = c(Protein, Starch, Fat, Fiber, Ash),
+               names_to = 'Component',
+               values_to = 'Value') %>%
+  ggplot(aes(x = Value, fill = Group)) +
+  geom_density(alpha = 0.7) +
+  labs(x = NULL,
+       tag = 'B') +
+  scale_fill_manual(values = c('Validation' = 'black', 'Not Validation' = 'gray')) +
+  facet_wrap(~Component, scales = 'free', ncol = 1) +
+  theme_classic()+
+  theme(legend.position = 'bottom',
+        text = element_text(size = 10, color = 'black'))+
+  guides(fill = guide_legend(title = 'Validation Status', override.aes = list(alpha = 1)))
+
+composition_plots
+
+ggsave('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/composition_plots.png',
+       plot = composition_plots,
+       width = 3.75,
+       height = 5.5,
+       dpi = 300)
+
+```
+
+The composition appears to be well represented as well. The validation samples are well distributed across the compositional space.
+
+# Assessing Many Relationships with Pericarp Retention
+After cooking 60 samples in replicate (with two subsamples collected per replicate) in a benchtop cook and rapid cook (and collecting some additional morphological and raw kernel data), let's see what is related (if anything) to the benchtop cook test pericarp retention results.  For this assessment, we are going to use mg pericarp dry mass / g kernel dry mass as the pericarp retention value.
+
+We know that the benchtop cook test pericarp retention is not normally distributed, so we will use a log transformation to transform it when the time comes. We will be comparing this value to the rapid cook test pericarp retention, the initial pericarp quantity, the average kernel mass, average kernel volume, and kernel density. We also score stained images of the pericarp after the benchtop and rapid cooks and scored them 1-5 following the Serna-Saldivar et al. (1991) method (1 = 0-20% coverage, 2 = 20-40% coverage, 3 = 40-60% coverage, 4 = 60-80% coverage, 5 = 80-100% coverage).
+
+## Read in and format the data
+```{r read in and format data, message = FALSE, warning = FALSE}
+benchtop_data = read_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/Pericarp_Retention_Methods_Validation - Benchtop_Cook.csv') %>%
+  select(Sample_ID, Hotplate_ID,
+         N_Kernels_1, N_Kernels_2,
+         Dry_Pericarp_Mass_1, Dry_Pericarp_Mass_2,
+         Dry_Kernels_Mass_1, Dry_Kernels_Mass_2,
+         Image_Rating) %>%
+  rename(Rep = Hotplate_ID) %>% 
+  mutate(Dry_Kernels_Mass_1 = case_when(Dry_Kernels_Mass_1 < 500 ~ NA,
+                                        TRUE ~ Dry_Kernels_Mass_1),
+         Dry_Kernels_Mass_2 = case_when(Dry_Kernels_Mass_2 < 500 ~ NA,
+                                        TRUE ~ Dry_Kernels_Mass_2),
+         Pericarp_Retention_1 = Dry_Pericarp_Mass_1 / N_Kernels_1 / ((Dry_Kernels_Mass_1 / N_Kernels_1) / 1000),
+         Pericarp_retention_2 = Dry_Pericarp_Mass_2 / N_Kernels_2 / ((Dry_Kernels_Mass_2 / N_Kernels_2) / 1000)) %>% 
+  pivot_longer(cols = c(Pericarp_Retention_1, Pericarp_retention_2),
+               names_to = 'Subsample',
+               values_to = 'Pericarp_Retention') %>%
+  group_by(Sample_ID) %>%
+  summarize(Pericarp_Retention = mean(Pericarp_Retention, na.rm = TRUE),
+            Benchtop_Image_Rating = mean(Image_Rating, na.rm = TRUE))
+
+#hist(log(benchtop_data$Pericarp_Retention))
+
+rapid_data = read_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/Pericarp_Retention_Methods_Validation - Rapid_Cook.csv') %>%
+  select(Sample_ID, Rep,
+         N_Kernels_1, N_Kernels_2,
+         Dry_Pericarp_Mass_1, Dry_Pericarp_Mass_2,
+         Dry_Kernels_Mass_1, Dry_Kernels_Mass_2,
+         Image_Rating) %>%
+  mutate(Dry_Kernels_Mass_1 = case_when(Dry_Kernels_Mass_1 < 500 ~ NA,
+                                        TRUE ~ Dry_Kernels_Mass_1),
+         Dry_Kernels_Mass_2 = case_when(Dry_Kernels_Mass_2 < 500 ~ NA,
+                                        TRUE ~ Dry_Kernels_Mass_2),
+         Pericarp_Retention_1 = Dry_Pericarp_Mass_1 / N_Kernels_1 / ((Dry_Kernels_Mass_1 / N_Kernels_1) / 1000),
+         Pericarp_retention_2 = Dry_Pericarp_Mass_2 / N_Kernels_2 / ((Dry_Kernels_Mass_2 / N_Kernels_2) / 1000)) %>% 
+  pivot_longer(cols = c(Pericarp_Retention_1, Pericarp_retention_2),
+               names_to = 'Subsample',
+               values_to = 'Pericarp_Retention') %>%
+  group_by(Sample_ID) %>%
+  summarize(Rapid_Pericarp_Retention = mean(Pericarp_Retention, na.rm = TRUE),
+            Rapid_Image_Rating = mean(Image_Rating, na.rm = TRUE))
+
+initial_data = read_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/Pericarp_Retention_Methods_Validation - Initial_Pericarp.csv') %>%
+  select(Sample_ID, Rep,
+         N_Kernels_Peeled_1, N_Kernels_Peeled_2, N_Kernels_Total,
+         Whole_Kernel_Mass, Kernel_Volume, Whole_Kernel_Density,
+         Dry_Pericarp_Mass_1, Dry_Pericarp_Mass_2,
+         Dry_Kernels_Mass_1, Dry_Kernels_Mass_2) %>%
+  mutate(Dry_Kernels_Mass_1 = case_when(Dry_Kernels_Mass_1 < 500 ~ NA,
+                                        TRUE ~ Dry_Kernels_Mass_1),
+         Dry_Kernels_Mass_2 = case_when(Dry_Kernels_Mass_2 < 500 ~ NA,
+                                        TRUE ~ Dry_Kernels_Mass_2),
+         Whole_Kernel_Mass = Whole_Kernel_Mass / N_Kernels_Total,
+         Kernel_Volume = Kernel_Volume / N_Kernels_Total,
+         Whole_Kernel_Density = (Whole_Kernel_Mass / 1000) / Kernel_Volume,
+         Pericarp_Quantity_1 = (Dry_Pericarp_Mass_1 / N_Kernels_Peeled_1) /((Dry_Kernels_Mass_1 / N_Kernels_Peeled_1) / 1000),
+         Pericarp_Quantity_2 = (Dry_Pericarp_Mass_2 / N_Kernels_Peeled_2) / ((Dry_Kernels_Mass_2 / N_Kernels_Peeled_2) / 1000)) %>%
+  select(Sample_ID, Whole_Kernel_Mass, Kernel_Volume, Whole_Kernel_Density,
+         Pericarp_Quantity_1, Pericarp_Quantity_2) %>%
+  pivot_longer(cols = c(Pericarp_Quantity_1, Pericarp_Quantity_2),
+               names_to = 'Subsample',
+               values_to = 'Pericarp_Quantity') %>%
+  group_by(Sample_ID) %>%
+  summarize(Kernel_Mass = mean(Whole_Kernel_Mass, na.rm = TRUE),
+            Kernel_Volume = mean(Kernel_Volume, na.rm = TRUE),
+            Kernel_Density = mean(Whole_Kernel_Density, na.rm = TRUE),
+            Initial_Pericarp_Quantity = mean(Pericarp_Quantity, na.rm = TRUE))
+
+perten_data = ych_perten_comp
+
+shape_data = read_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/Raw_Kernels_Region_Props.csv') %>%
+  mutate(Sample_ID = paste(str_extract(Sample_ID, '^YCH2[0-9]'),
+                           str_extract(Sample_ID, '[0-9]{4}$'),
+                           sep = ':')) %>%
+  group_by(Sample_ID, Hotplate_ID) %>%
+  filter(area > quantile(area, 0.25) - (1.5*IQR(area)),
+         area < quantile(area, 0.75) + (1.5*IQR(area)),
+         perimeter > quantile(perimeter, 0.25) - (1.5*IQR(perimeter)),
+         perimeter < quantile(perimeter, 0.75) + (1.5*IQR(perimeter)),
+         major_axis_length > quantile(major_axis_length, 0.25) - (1.5*IQR(major_axis_length)),
+         major_axis_length < quantile(major_axis_length, 0.75) + (1.5*IQR(major_axis_length)),
+         minor_axis_length > quantile(minor_axis_length, 0.25) - (1.5*IQR(minor_axis_length)),
+         minor_axis_length < quantile(minor_axis_length, 0.75) + (1.5*IQR(minor_axis_length)),
+         eccentricity > quantile(eccentricity, 0.25) - (1.5*IQR(eccentricity)),
+         eccentricity < quantile(eccentricity, 0.75) + (1.5*IQR(eccentricity)),
+         solidity > quantile(solidity, 0.25) - (1.5*IQR(solidity)),
+         solidity < quantile(solidity, 0.75) + (1.5*IQR(solidity)),
+         extent > quantile(extent, 0.25) - (1.5*IQR(extent)),
+         extent < quantile(extent, 0.75) + (1.5*IQR(extent))) %>%
+  group_by(Sample_ID) %>%
+  summarize(Area = mean(area),
+            Perimeter = mean(perimeter),
+            Length = mean(major_axis_length),
+            Width = mean(minor_axis_length),
+            Circularity = mean(eccentricity),
+            Solidity = mean(solidity),
+            Rectangularity = mean(extent)) %>%
+  filter(Sample_ID %in% benchtop_data$Sample_ID)
+```
+
+## Combine Datasets
+In order to make the multiple comparisons we want to make across traits we need to merge the datasets to include the benchtop cook test results, the rapid cook test results, the initial kernel data, and the compositional data.
+
+```{r combine datasets, message = FALSE, warning = FALSE}
+pericarp_data = benchtop_data %>%
+  left_join(rapid_data, by = 'Sample_ID') %>%
+  left_join(initial_data, by = 'Sample_ID') %>%
+  left_join(ych_perten_comp_clean, by = 'Sample_ID') %>%
+  left_join(ych_foss_comp_clean %>%
+              rename(Foss_Protein = Protein,
+                     Foss_Starch = Starch,
+                     Foss_Oil = Oil,
+                     Foss_Density = Density), by = 'Sample_ID') %>%
+  left_join(shape_data, by = 'Sample_ID') %>%
+  distinct(Sample_ID, .keep_all = TRUE) %>%
+  #filter(!is.na(Genotype)) %>%
+  select(-Genotype, -Foss_Density)
+
+pericarp_data %>%
+  write_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/initial_dataset_traits.csv')
+```
+
+### Plot out the distributions for all features
+```{r plot out data distributions, message = FALSE, warning = FALSE}
+data_distribution_plot = pericarp_data %>%
+  select(-Sample_ID, -Solidity) %>%
+  rename(`Stain Rating` = Benchtop_Image_Rating,
+         `Rapid Stain Rating` = Rapid_Image_Rating,
+         `Ground Kernel Protein` = Protein,
+         `Ground Kernel Starch` = Starch,
+         `Ground Kernel Fiber` = Fiber,
+         `Ground Kernel Fat` = Fat,
+         `Ground Kernel Ash` = Ash) %>%
+  mutate(Pericarp_Retention = exp(Pericarp_Retention),
+         Rapid_Pericarp_Retention = exp(Rapid_Pericarp_Retention)) %>%
+  pivot_longer(cols = everything(),
+               names_to = 'Feature',
+               values_to = 'Value') %>%
+  mutate(Feature = str_replace_all(Feature, '_', ' '),
+         Feature = str_replace(Feature, 'Foss ', 'Whole Kernel '),
+         Feature = str_remove(Feature, 'Benchtop '),
+         Feature = factor(Feature, levels = c('Pericarp Retention',
+                                              'Stain Rating',
+                                              'Rapid Pericarp Retention',
+                                              'Rapid Stain Rating',
+                                              'Ground Kernel Protein',
+                                              'Ground Kernel Starch',
+                                              'Ground Kernel Fiber',
+                                              'Ground Kernel Fat',
+                                              'Ground Kernel Ash',
+                                              'Whole Kernel Protein',
+                                              'Whole Kernel Starch',
+                                              'Whole Kernel Oil',
+                                              'Initial Pericarp Quantity',
+                                              'Foss_Density',
+                                              'Kernel Mass',
+                                              'Kernel Volume',
+                                              'Kernel Density',
+                                              'Area',
+                                              'Perimeter',
+                                              'Length',
+                                              'Width',
+                                              'Circularity',
+                                              'Solidity',
+                                              'Rectangularity'))) %>%
+  ggplot(aes(x = Value))+
+  geom_density(fill = 'gray')+
+  facet_wrap(~Feature, scales = 'free', ncol = 4)+
+  labs(x = NULL,
+       y = 'density')+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'))
+
+data_distribution_plot
+
+ggsave('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/data_distribution_plot.png',
+       plot = data_distribution_plot,
+       width = 7.5,
+       height = 5,
+       dpi = 300)
+
+```
+
+### Rapid cook retention vs image rating
+```{r rapid pericarp retention vs rapid image rating, message = FALSE, warning = FALSE}
+rapid_cook_cor_plot = pericarp_data %>%
+  ggplot(aes(x = Rapid_Image_Rating, y = log(Rapid_Pericarp_Retention)))+
+  geom_point()+
+  geom_smooth(method = 'lm', se = F, color = 'black')+
+  ggpubr::stat_cor(method = 'pearson', label.sep = '\n', label.y = 1.2)+
+  labs(x = 'Rapid Cook Rating',
+       y = 'log(RCPR)',
+       tag = 'A')+
+  xlim(1,5)+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'))
+
+rapid_cook_cor_plot
+
+ggsave('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/rapid_cook_cor_plot.png',
+       plot = rapid_cook_cor_plot,
+       width = 1.87,
+       height = 1.75,
+       dpi = 300)
+```
+
+### Benchtop cook retention vs image rating
+```{r benchtop pericarp retention vs image rating, message = FALSE, warning = FALSE}
+benchtop_cook_cor_plot = pericarp_data %>%
+  ggplot(aes(x = Benchtop_Image_Rating, y = log(Pericarp_Retention)))+
+  geom_point()+
+  geom_smooth(method = 'lm', se = F, color = 'black')+
+  ggpubr::stat_cor(method = 'pearson', label.sep = '\n',label.x = 2.5)+
+  labs(x = 'Benchtop Cook Rating',
+       y = 'log(BCPR)',
+       tag = 'B')+
+  xlim(1,5)+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'))
+
+benchtop_cook_cor_plot
+
+ggsave('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/benchtop_cook_cor_plot.png',
+       plot = benchtop_cook_cor_plot,
+       width = 1.87,
+       height = 1.75,
+       dpi = 300)
+```
+
+### Benchtop cook rating vs rapid cook rating
+```{r benchtop image rating vs rapid image rating, message = FALSE, warning = FALSE}
+benchtop_rapid_cook_rating_cor_plot = pericarp_data %>%
+  ggplot(aes(x = Rapid_Image_Rating, y = Benchtop_Image_Rating))+
+  geom_point()+
+  geom_smooth(method = 'lm', se = F, color = 'black')+
+  ggpubr::stat_cor(method = 'pearson', label.sep = '\n')+
+  labs(x = 'Rapid Cook Rating',
+       y = 'Benchtop Cook Rating',
+       tag = 'C')+
+  xlim(1,5)+
+  ylim(1,5)+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'))
+
+benchtop_rapid_cook_rating_cor_plot
+
+ggsave('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/benchtop_rapid_cook_rating_cor_plot.png',
+       plot = benchtop_rapid_cook_rating_cor_plot,
+       width = 1.87,
+       height = 1.75,
+       dpi = 300)
+```
+
+### Benchtop cook retention vs rapid cook retention
+```{r benchtop pericarp retention vs rapid cook retention, message = FALSE, warning = FALSE}
+benchtop_rapid_cook_cor_plot = pericarp_data %>%
+  ggplot(aes(x = log(Rapid_Pericarp_Retention), y = log(Pericarp_Retention)))+
+  geom_point()+
+  geom_smooth(method = 'lm', se = F, color = 'black')+
+  ggpubr::stat_cor(method = 'pearson', label.sep = '\n', label.x = 0.953, label.y = -2.4)+
+  labs(x = 'log(RCPR)',
+       y = 'log(BCPR)',
+       tag = 'D')+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'))
+
+benchtop_rapid_cook_cor_plot
+
+ggsave('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/benchtop_rapid_cook_cor_plot.png',
+       plot = benchtop_rapid_cook_cor_plot,
+       width = 1.87,
+       height = 1.75,
+       dpi = 300)
+```
+
+## Assess Biological Replicates
+```{r assess biological replicates, message = FALSE, warning = FALSE}
+cor_data = read_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/Pericarp_Retention_Methods_Validation - Benchtop_Cook.csv') %>%
+  select(Sample_ID, Hotplate_ID, Kernel_Cleaner, Cook_Date, pH, Peeler,
+         N_Kernels_1, N_Kernels_2,
+         Dry_Pericarp_Mass_1, Dry_Pericarp_Mass_2,
+         Dry_Kernels_Mass_1, Dry_Kernels_Mass_2,
+         Image_Rating) %>%
+  rename(Rep = Hotplate_ID) %>%
+  mutate(Dry_Kernels_Mass_1 = case_when(Dry_Kernels_Mass_1 < 500 ~ NA,
+                                        TRUE ~ Dry_Kernels_Mass_1),
+         Dry_Kernels_Mass_2 = case_when(Dry_Kernels_Mass_2 < 500 ~ NA,
+                                        TRUE ~ Dry_Kernels_Mass_2),
+         Pericarp_Retention_1 = Dry_Pericarp_Mass_1 / N_Kernels_1 / ((Dry_Kernels_Mass_1 / N_Kernels_1) / 1000),
+         Pericarp_retention_2 = Dry_Pericarp_Mass_2 / N_Kernels_2 / ((Dry_Kernels_Mass_2 / N_Kernels_2) / 1000)) %>% 
+  pivot_longer(cols = c(Pericarp_Retention_1, Pericarp_retention_2),
+               names_to = 'Subsample',
+               values_to = 'Pericarp_Retention') %>%
+  group_by(Sample_ID, Rep) %>%
+  summarize(Pericarp_Retention = mean(Pericarp_Retention, na.rm = TRUE),
+            Cook = unique(Kernel_Cleaner),
+            Peeler = unique(Peeler),
+            pH = unique(pH)) %>%
+  group_by(Sample_ID) %>%
+  mutate(Cooks = paste0(sort(Cook), collapse = '-'),
+         Peelers = paste0(sort(Peeler), collapse = '-'),
+         pH_Range = max(pH) - min(pH),
+         pH_Mean = mean(pH)) %>%
+  select(-Cook, -Peeler, -pH) %>%
+  pivot_wider(names_from = Rep,
+              values_from = Pericarp_Retention) %>%
+  ungroup()
+
+benchtop_bio_rep_plot = cor_data %>%
+  ggplot(aes(x = log(A), y = log(B)))+
+  geom_abline(slope = 1, intercept = 0, color = 'gray', linetype = 'dashed')+
+  geom_point()+
+  geom_smooth(method = 'lm', se = FALSE, color = 'black')+
+  ggpubr::stat_cor(method = 'pearson', label.sep = '\n')+
+  labs(x = 'log(Benchtop Hotplate A)',
+       y = 'log(Benchtop Hotplate B)',
+       tag = 'A')+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'))
+
+cor.test(log(cor_data$A), log(cor_data$B))
+
+benchtop_bio_rep_plot
+
+ggsave('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/benchtop_bio_rep_plot.png',
+       plot = benchtop_bio_rep_plot,
+       width = 3.75,
+       height = 3.5,
+       dpi = 300)
+```
+
+Based on the correlation test (Pearson was used to get a confidence interval), it appears that the likely upper limit of a machine learning model would be 0.67 (+/- 0.1). For comparison, I looked at the correlation of 60 randomly chosen genotypes from the hybrid moisture content paper 100 times and found a biological replicate correlation of about 0.87 +/- 0.1 (this only becomes a more consistent pattern when filtering for only YCH samples - SD drops to 0.05). This moisture content model saw an overall correlation of about 0.82.
+
+This is a pretty big difference in correlation values, so it is likely that the benchtop cook test will have a correlation upper limit of about 0.67 for a machine learning model with about 300 samples. I do not have a reason to think that this wouldn't follow similar performance patterns to the moisture content system and somehow perform better than the biological replicates.
+
+Lets see if we can find a reasonable answer to why the benchtop cook biological replicates are not very highly correlated.
+### Differences in Pollen Parents
+```{r differences in pollen parents, message = FALSE, warning = FALSE}
+cor_data %>%
+  left_join(genotype_xref,
+            by = c('Sample_ID' = 'Plot')) %>%
+  separate(Genotype, into = c('Egg_Parent', 'Pollen_Parent'), sep = ' X ') %>%
+  ggplot(aes(x = log(A), y = log(B), color = Pollen_Parent))+
+  geom_abline(slope = 1, intercept = 0, color = 'gray', linetype = 'dashed')+
+  geom_point()+
+  geom_smooth(method = 'lm', se = FALSE)+
+  ggpubr::stat_cor(method = 'pearson', show.legend = F)+
+  labs(x = 'log(Hotplate A)',
+       y = 'log(Hotplate B)')+
+  theme_classic()
+
+summary(aov(lm(error ~ Pollen_Parent, data = cor_data %>%
+                 left_join(genotype_xref,
+            by = c('Sample_ID' = 'Plot')) %>%
+  separate(Genotype, into = c('Egg_Parent', 'Pollen_Parent'), sep = ' X ') %>%
+         mutate(error = log(A) - log(B)))))
+```
+
+It appears that pollen parent could have a small impact on the overall correlation, but there does not appear to be a super strong Simpson's paradox at play. B73 and LH244 are definitely reducing the overall correlation, but they don't have the full range that Mo17 does, which could easily be reducing the correlation.
+
+### Peelers
+```{r differences in peelers, message = FALSE, warning = FALSE}
+peeler_cor_plot = cor_data %>%
+  filter(Peelers != 'AG') %>% # Remove outlier that is listed as only having one peeler
+  mutate(Peelers = case_when(Peelers == 'AG-PH' ~ 'Split',
+                             Peelers == 'PH-PH' ~ 'X',
+                             Peelers == 'AG-AG' ~ 'Y')) %>%
+  ggplot(aes(x = log(A), y = log(B), color = Peelers))+
+  geom_abline(slope = 1, intercept = 0, color = 'gray', linetype = 'dashed')+
+  geom_point()+
+  geom_smooth(method = 'lm', se = FALSE)+
+  ggpubr::stat_cor(method = 'pearson', show.legend = F)+
+  scale_color_manual(values = c('X' = 'blue3', 'Y' = 'red3', 'Split' = 'darkviolet'))+
+  labs(x = 'log(Benchtop Cook Rep 1)',
+       y = 'log(Benchtop Cook Rep 2)')+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'))
+
+peeler_cor_plot
+
+ggsave('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/peeler_cor_plot.png',
+       plot = peeler_cor_plot,
+       width = 7.5,
+       height = 4,
+       dpi = 300)
+
+summary(aov(lm(error ~ Peelers, data = cor_data %>%
+         mutate(error = log(A) - log(B)))))
+
+paired_ttest_data = read_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/Pericarp_Retention_Methods_Validation - Benchtop_Cook.csv') %>%
+  select(Sample_ID, Hotplate_ID, Cook, Cook_Date, pH, Peeler,
+         N_Kernels_1, N_Kernels_2,
+         Dry_Pericarp_Mass_1, Dry_Pericarp_Mass_2,
+         Dry_Kernels_Mass_1, Dry_Kernels_Mass_2,
+         Image_Rating) %>%
+  rename(Rep = Hotplate_ID) %>%
+  mutate(Dry_Kernels_Mass_1 = case_when(Dry_Kernels_Mass_1 < 500 ~ NA,
+                                        TRUE ~ Dry_Kernels_Mass_1),
+         Dry_Kernels_Mass_2 = case_when(Dry_Kernels_Mass_2 < 500 ~ NA,
+                                        TRUE ~ Dry_Kernels_Mass_2),
+         Pericarp_Retention_1 = Dry_Pericarp_Mass_1 / N_Kernels_1 / ((Dry_Kernels_Mass_1 / N_Kernels_1) / 1000),
+         Pericarp_retention_2 = Dry_Pericarp_Mass_2 / N_Kernels_2 / ((Dry_Kernels_Mass_2 / N_Kernels_2) / 1000)) %>% 
+  pivot_longer(cols = c(Pericarp_Retention_1, Pericarp_retention_2),
+               names_to = 'Subsample',
+               values_to = 'Pericarp_Retention') %>%
+  group_by(Sample_ID, Rep) %>%
+  summarize(Pericarp_Retention = mean(Pericarp_Retention, na.rm = TRUE),
+            Cook = unique(Cook),
+            Peeler = unique(Peeler),
+            pH = unique(pH)) %>%
+  select(Peeler, Rep, Pericarp_Retention) %>%
+  pivot_wider(names_from = Peeler,
+              values_from = c(Rep, Pericarp_Retention)) %>%
+  unnest(everything()) %>%
+  filter(!is.na(Rep_PH) & !is.na(Rep_AG))
+
+t.test(log(paired_ttest_data$Pericarp_Retention_PH), log(paired_ttest_data$Pericarp_Retention_AG), paired = T)
+
+cor.test(log(paired_ttest_data$Pericarp_Retention_PH), log(paired_ttest_data$Pericarp_Retention_AG))
+```
+
+The peeler consistency does not appear to have a strong impact on the trait value range of biological replicates, but samples that had two peelers appear to have a lower correlation.
+
+### Cooks
+```{r differences in cooks, message = FALSE, warning = FALSE}
+cor_data %>%
+  ggplot(aes(x = log(A), y = log(B), color = Cooks))+
+  geom_abline(slope = 1, intercept = 0, color = 'gray', linetype = 'dashed')+
+  geom_point()+
+  geom_smooth(method = 'lm', se = FALSE)+
+  ggpubr::stat_cor(method = 'pearson', show.legend = F)+
+  labs(x = 'log(Hotplate A)',
+       y = 'log(Hotplate B)')+
+  theme_classic()
+
+summary(aov(lm(error ~ Cooks, data = cor_data %>%
+         mutate(error = log(A) - log(B)))))
+
+paired_ttest_data = read_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/Pericarp_Retention_Methods_Validation - Benchtop_Cook.csv') %>%
+  select(Sample_ID, Hotplate_ID, Kernel_Cleaner, Cook_Date, pH, Peeler,
+         N_Kernels_1, N_Kernels_2,
+         Dry_Pericarp_Mass_1, Dry_Pericarp_Mass_2,
+         Dry_Kernels_Mass_1, Dry_Kernels_Mass_2,
+         Image_Rating) %>%
+  rename(Rep = Hotplate_ID) %>%
+  mutate(Dry_Kernels_Mass_1 = case_when(Dry_Kernels_Mass_1 < 500 ~ NA,
+                                        TRUE ~ Dry_Kernels_Mass_1),
+         Dry_Kernels_Mass_2 = case_when(Dry_Kernels_Mass_2 < 500 ~ NA,
+                                        TRUE ~ Dry_Kernels_Mass_2),
+         Pericarp_Retention_1 = Dry_Pericarp_Mass_1 / N_Kernels_1 / ((Dry_Kernels_Mass_1 / N_Kernels_1) / 1000),
+         Pericarp_retention_2 = Dry_Pericarp_Mass_2 / N_Kernels_2 / ((Dry_Kernels_Mass_2 / N_Kernels_2) / 1000)) %>% 
+  pivot_longer(cols = c(Pericarp_Retention_1, Pericarp_retention_2),
+               names_to = 'Subsample',
+               values_to = 'Pericarp_Retention') %>%
+  group_by(Sample_ID, Rep) %>%
+  summarize(Pericarp_Retention = mean(Pericarp_Retention, na.rm = TRUE),
+            Cook = unique(Kernel_Cleaner),
+            Peeler = unique(Peeler),
+            pH = unique(pH)) %>%
+  select(Cook, Rep, Pericarp_Retention) %>%
+  pivot_wider(names_from = Cook,
+              values_from = c(Rep, Pericarp_Retention)) %>%
+  unnest(everything()) %>%
+  filter(!is.na(Rep_MJB) & !is.na(Rep_AMG))
+
+t.test(log(paired_ttest_data$Pericarp_Retention_MJB), log(paired_ttest_data$Pericarp_Retention_AMG), paired = T)
+
+cor.test(log(paired_ttest_data$Pericarp_Retention_MJB), log(paired_ttest_data$Pericarp_Retention_AMG))
+```
+
+The consistency of peelers does not appear to have a strong impact on the trait value range of biological replicates, but samples that had two cooks appear to have a lower correlation.
+
+### pH
+```{r effect of pH on biological replicates, message = FALSE, warning = FALSE}
+cor_data %>%
+  mutate(Error = log(A) - log(B)) %>%
+  ggplot(aes(x = pH_Range, y = Error))+
+  geom_point()+
+  geom_smooth(method = 'lm', se = FALSE)+
+  ggpubr::stat_cor(method = 'pearson')+
+  labs(x = 'pH Mean',
+       y = 'Error')+
+  theme_classic()
+```
+
+The range of pH values does not appear to be correlated (at all) with the error found in the biological replicates. This is a good sign that pH is not a major factor in the variation of the benchtop cook test.
+
+### Rapid Cook Test Internal Correlation
+```{r rapid cook test internal correlation, message = FALSE, warning = FALSE}
+rapid_cook_cor_data = read_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/Pericarp_Retention_Methods_Validation - Rapid_Cook.csv') %>%
+  select(Sample_ID, Rep, Peeler,
+         N_Kernels_1, N_Kernels_2,
+         Dry_Pericarp_Mass_1, Dry_Pericarp_Mass_2,
+         Dry_Kernels_Mass_1, Dry_Kernels_Mass_2,
+         Image_Rating) %>%
+  mutate(Dry_Kernels_Mass_1 = case_when(Dry_Kernels_Mass_1 < 500 ~ NA,
+                                        TRUE ~ Dry_Kernels_Mass_1),
+         Dry_Kernels_Mass_2 = case_when(Dry_Kernels_Mass_2 < 500 ~ NA,
+                                        TRUE ~ Dry_Kernels_Mass_2),
+         Pericarp_Retention_1 = Dry_Pericarp_Mass_1 / N_Kernels_1 / ((Dry_Kernels_Mass_1 / N_Kernels_1) / 1000),
+         Pericarp_retention_2 = Dry_Pericarp_Mass_2 / N_Kernels_2 / ((Dry_Kernels_Mass_2 / N_Kernels_2) / 1000)) %>% 
+  pivot_longer(cols = c(Pericarp_Retention_1, Pericarp_retention_2),
+               names_to = 'Subsample',
+               values_to = 'Pericarp_Retention') %>%
+  group_by(Sample_ID, Rep) %>%
+  summarise(Pericarp_Retention = mean(Pericarp_Retention, na.rm = TRUE),
+            Peeler = unique(Peeler)) %>%
+  group_by(Sample_ID) %>%
+  mutate(Peelers = length(unique(Peeler))) %>%
+  select(-Peeler) %>%
+  pivot_wider(names_from = Rep,
+              values_from = Pericarp_Retention) %>%
+  filter(Sample_ID != 'YCH23:2714')
+
+rapid_bio_rep_plot = rapid_cook_cor_data %>%
+  ggplot(aes(x = log(A), y = log(B)))+
+  geom_abline(slope = 1, intercept = 0, color = 'gray', linetype = 'dashed')+
+  geom_point()+
+  geom_smooth(method = 'lm', se = FALSE, color = 'black')+
+  ggpubr::stat_cor(method = 'pearson', label.sep = '\n')+
+  labs(x = 'log(Rapid Rep 1)',
+       y = 'log(Rapid Rep 2)',
+       tag = 'B')+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'))
+
+cor.test(log(rapid_cook_cor_data$A), log(rapid_cook_cor_data$B))
+
+rapid_bio_rep_plot
+
+ggsave('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/rapid_bio_rep_plot.png',
+       plot = rapid_bio_rep_plot,
+       width = 3.75,
+       height = 3.5,
+       dpi = 300)
+
+```
+
+It could be due to the small quantity of samples that were actually peeled by a single person for both reps, but the opposite trend appears to be true for the rapid cook. The samples that were peeled by two people appear to have a higher correlation than those peeled by one person.
+
+## Correlation between rapid and benchtop cook tests
+```{r rapid-bench correlation, message = FALSE, warning = FALSE}
+rapid_bench_cor_data = cor_data %>%
+  mutate(Pericarp_Retention = (A+B)/2) %>%
+  select(Sample_ID, Pericarp_Retention) %>%
+  left_join(pericarp_data %>%
+              select(Sample_ID, Rapid_Pericarp_Retention),
+            by = 'Sample_ID')
+
+rapid_bench_cor_plot = rapid_bench_cor_data %>%
+  ggplot(aes(x = log(Rapid_Pericarp_Retention), y = log(Pericarp_Retention)))+
+  geom_abline(slope = 1, intercept = 0, color = 'gray', linetype = 'dashed')+
+  geom_point()+
+  geom_smooth(se = F, method = 'lm', color = 'black')+
+  ggpubr::stat_cor(method = 'pearson', label.sep = '\n')+
+  labs(x = 'log(Rapid Pericarp Retention)',
+       y = 'log(Benchtop Pericarp Retention)',
+       tag = 'C')+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'))
+
+cor.test(log(rapid_bench_cor_data$Rapid_Pericarp_Retention), log(rapid_bench_cor_data$Pericarp_Retention))
+
+rapid_bench_cor_plot
+
+ggsave('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/rapid_bench_cor_plot.png',
+       plot = rapid_bench_cor_plot,
+       width = 2.5,
+       height = 3,
+       dpi = 300)
+```
+
+The correlation between rapid and benchtop pericarp retention is quite improved when reduced (to only 15 samples from 60) to samples that only have benchtop data from consistent cooks and peelers. This suggests that there is far too much variation coming from cooking and peeling methods of different people.
+
+### Samples with high error rates
+It might be worth finding samples that have high error rates and removing them if needed to improve our ability to find relationships in the benchtop cook test with other cooking, compositional, and morphological features.
+```{r samples with high error rates, message = FALSE, warning = FALSE}
+error_data = cor_data %>%
+  mutate(Error = abs(log(A) - log(B)), # Use logs here otherwise error will increase as pericarp quantity increases
+         Error = case_when(is.nan(Error) ~ Inf,
+                           T ~ Error)) %>%
+  arrange(desc(Error))
+
+hist(error_data$Error)
+
+n_to_remove = 11 # This removes everything with an error greater than 1
+
+reduced_error_samples = error_data %>%
+  slice(-c(1:n_to_remove)) %>%
+  select(Sample_ID) %>%
+  pull()
+
+cor_data %>%
+  mutate(Outlier = !Sample_ID %in% reduced_error_samples) %>%
+  ggplot(aes(x = log(A), y = log(B), color = Outlier))+
+  geom_abline(slope = 1, intercept = 0, color = 'gray', linetype = 'dashed')+
+  geom_point()+
+  geom_smooth(method = 'lm', se = FALSE)+
+  scale_color_manual(values = c('black', 'red'))+
+  ggpubr::stat_cor(method = 'pearson', show.legend = F)+
+  labs(x = 'log(Hotplate A)',
+       y = 'log(Hotplate B)')+
+  theme_classic()
+```
+
+## Calculate pericarp thickness proxy
+Pericarp thickness can be approximated with the data collected so far by dividing the original pericarp quantity across double the area of a kernel. This will not be perfect as the images did not gather the thickness of kernels, but it should be a relatively good proxy if you assume hybrid kernels are roughly the same width.
+
+```{r calculate pericarp thickness proxy, message = FALSE, warning = FALSE}
+# pericarp_data = pericarp_data %>%
+#   mutate(Pericarp_Thickness = case_when(Sample_ID == 'YCH23:2519' ~ NA, # Remove the outlier - OC19 hybrid - clearly didn't threshold well in image analysis
+#                                         T ~ (Initial_Pericarp_Quantity / (Area * 2)) * 1400)) # The 1400 is to offset the DPI scaling - 1400 pixels per square inch
+```
+
+## Make sure distributions are normal
+```{r normalize distribution of features, message = FALSE, warning = FALSE}
+# Log transform pericarp retention values
+pericarp_data = pericarp_data %>%
+  mutate(Pericarp_Retention = log(Pericarp_Retention),
+         Rapid_Pericarp_Retention = log(Rapid_Pericarp_Retention))
+
+# for(col in colnames(pericarp_data)){
+#   if(is.numeric(pericarp_data[[col]])){
+#     #print(col)
+#     base = shapiro.test(pericarp_data[[col]])$p.value
+#     sqrt_norm = shapiro.test(sqrt(pericarp_data[[col]]))$p.value
+#     log_norm = shapiro.test(log(pericarp_data[[col]]))$p.value
+#     outlier_rm = pericarp_data[[col]][pericarp_data[[col]] >
+#                                                      quantile(pericarp_data[[col]],
+#                                                               0.25,
+#                                                               na.rm = T) - IQR(pericarp_data[[col]],
+#                                                                                na.rm = T) &
+#                                                      pericarp_data[[col]] <
+#                                                      quantile(pericarp_data[[col]],
+#                                                               0.75,
+#                                                               na.rm = T) + IQR(pericarp_data[[col]],
+#                                                                                na.rm = T)]
+#     outlier_norm = shapiro.test(outlier_rm)$p.value
+#     #print(max(c(base, sqrt_norm, log_norm, outlier_norm)))
+#     if(max(c(base, sqrt_norm, log_norm, outlier_norm)) == outlier_norm){
+#       #print('Removing outliers is the best course of action')
+#       pericarp_data = pericarp_data %>%
+#         mutate(!!sym(col) := case_when(!!sym(col) %in% outlier_rm ~ !!sym(col),
+#                          T ~ NA))
+#     }
+#     if(max(c(base, sqrt_norm, log_norm, outlier_norm)) == log_norm){
+#       #print('Log transformation is the best course of action')
+#       pericarp_data = pericarp_data %>%
+#         mutate(!!sym(col) := log(!!sym(col)))
+#     }
+#     if(max(c(base, sqrt_norm, log_norm, outlier_norm)) == sqrt_norm){
+#       #print('Sqrt transformation is the best course of action')
+#       pericarp_data = pericarp_data %>%
+#         mutate(!!sym(col) := sqrt(!!sym(col)))
+#     }
+#   }
+# }
+```
+
+# Pairwise Plots
+## Cook Test Data Pairwise Plots
+```{r plot out data distributions and correlations of cook test data, message = FALSE, warning = FALSE}
+# Full Dataset
+pair_cor_data = pericarp_data
+
+colnames(pair_cor_data) = gsub('_', ' ', colnames(pair_cor_data))
+
+paired_plot_cook = ggpairs(pair_cor_data,
+        columns = c('Pericarp Retention',
+                    'Rapid Pericarp Retention',
+                    'Benchtop Image Rating',
+                    'Rapid Image Rating'),
+        diag = list(continuous = wrap('densityDiag', fill = 'gray')),
+        lower = list(continuous = wrap('smooth', se = F)),
+        upper = list(continuous = wrap("cor", size = 5, color = 'black')))+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'))
+
+paired_plot_cook
+
+# pairs(pericarp_data %>%
+#         select(Pericarp_Retention,
+#                Rapid_Pericarp_Retention,
+#                Benchtop_Image_Rating,
+#                Rapid_Image_Rating),
+#       upper.panel = function(x, y, digits = 2, prefix = "", cex.cor, ...) {
+#                       usr <- par("usr")
+#                       on.exit(par(usr))
+#                       par(usr = c(0, 1, 0, 1))
+#                       Cor <- cor(x, y, method = 'spearman', use = 'complete.obs')
+#                       cor_p = cor.test(x, y, method = 'spearman', use = 'complete.obs')$p.value
+#                       if(cor_p < 0.05){
+#                         txt <- paste0(prefix, format(c(Cor, 0.123456789), digits = digits)[1])
+#                       } else {
+#                         txt <- ''
+#                       }
+#                       if(missing(cex.cor)) {
+#                           cex.cor <- 0.4 / strwidth(txt)
+#                       }
+#                       text(0.5, 0.5, txt,
+#                            cex = (1-cor_p) + cex.cor * abs(Cor)) # Resize the text by level of correlation
+#                     },
+#       diag.panel = function(x, ...) {
+#                      usr <- par("usr")
+#                      on.exit(par(usr))
+#                      par(usr = c(usr[1:2], 0, 1.5))
+#                      his <- hist(x, plot = FALSE)
+#                      breaks <- his$breaks
+#                      nB <- length(breaks)
+#                      y <- his$counts
+#                      y <- y/max(y)
+#                      rect(breaks[-nB], 0, breaks[-1], y, col = rgb(0, 1, 1, alpha = 0.5), ...)
+#                      # lines(density(x), col = 2, lwd = 2) # Uncomment to add density lines
+#                      }
+# )
+# 
+# # Reduced Dataset
+# pairs(pericarp_data %>%
+#         left_join(cor_data %>%
+#                     select(Sample_ID, Peelers)) %>%
+#         filter(Peelers %in% c('AG-AG', 'PH-PH')) %>%
+#         select(Pericarp_Retention,
+#                Rapid_Pericarp_Retention,
+#                Benchtop_Image_Rating,
+#                Rapid_Image_Rating),
+#       upper.panel = function(x, y, digits = 2, prefix = "", cex.cor, ...) {
+#                       usr <- par("usr")
+#                       on.exit(par(usr))
+#                       par(usr = c(0, 1, 0, 1))
+#                       Cor <- cor(x, y, method = 'spearman', use = 'complete.obs')
+#                       cor_p = cor.test(x, y, method = 'spearman', use = 'complete.obs')$p.value
+#                       if(cor_p < 0.05){
+#                         txt <- paste0(prefix, format(c(Cor, 0.123456789), digits = digits)[1])
+#                       } else {
+#                         txt <- ''
+#                       }
+#                       if(missing(cex.cor)) {
+#                           cex.cor <- 0.4 / strwidth(txt)
+#                       }
+#                       text(0.5, 0.5, txt,
+#                            cex = (1-cor_p) + cex.cor * abs(Cor)) # Resize the text by level of correlation
+#                     },
+#       diag.panel = function(x, ...) {
+#                      usr <- par("usr")
+#                      on.exit(par(usr))
+#                      par(usr = c(usr[1:2], 0, 1.5))
+#                      his <- hist(x, plot = FALSE)
+#                      breaks <- his$breaks
+#                      nB <- length(breaks)
+#                      y <- his$counts
+#                      y <- y/max(y)
+#                      rect(breaks[-nB], 0, breaks[-1], y, col = rgb(0, 1, 1, alpha = 0.5), ...)
+#                      # lines(density(x), col = 2, lwd = 2) # Uncomment to add density lines
+#                      }
+# )
+```
+
+Benchtop pericarp retention does not appear to correlate very well with any of the other variables. It is notable however that the rapid pericarp retention is the best correlation value with the benchtop pericarp retention (Rs = 0.65).
+
+The rapid image rating appears to actually correlate nicely with the rapid cook test pericarp content (0.77) and the benchtop image rating correlates with the benchtop cook test pericarp content (0.63), but this seems to be driven by a single point that might be an outlier for high pericarp content.
+
+Additionally, I found a masters thesis from 2003 where the authors assessed pericarp retention using the serna-saldivar staining method and assessed 9 samples for both the rapid cook proposed in serna-saldivar 1991, and an optimal cook (time was based on average time it took grain to reach 50% moisture). Based on the barplot they provided, it appears that they observed a pearson correlation of 0.56 between rapid and optimal ratings. This isn't quite an apples to apples comparison though as they had much larger variation in cooking times (6min - 34min). The paper can be found at: https://www.researchgate.net/publication/26895520_Food_quality_and_properties_of_quality_protein_maize
+
+## Kernel Feature Data Pairwise Plots
+```{r plot out data distributions and correlations with kernel data, message = FALSE, warning = FALSE}
+# Full Dataset
+paired_plot_morph = ggpairs(pair_cor_data,
+        columns = c('Pericarp Retention',
+                    'Kernel Mass',
+                    'Kernel Volume',
+                    'Kernel Density',
+                    'Initial Pericarp Quantity'),
+        diag = list(continuous = wrap('densityDiag', fill = 'gray')),
+        lower = list(continuous = wrap('smooth', se = F)),
+        upper = list(continuous = wrap("cor", size = 5, color = 'black')))+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'))
+
+paired_plot_morph
+
+# pairs(pericarp_data %>%
+#         select(Pericarp_Retention,
+#                Kernel_Mass,
+#                Kernel_Volume,
+#                Kernel_Density,
+#                Initial_Pericarp_Quantity,
+#                Pericarp_Thickness) %>%
+#         mutate(mass_by_volume = Kernel_Mass * Kernel_Volume),
+#       upper.panel = function(x, y, digits = 2, prefix = "", cex.cor, ...) {
+#                       usr <- par("usr")
+#                       on.exit(par(usr))
+#                       par(usr = c(0, 1, 0, 1))
+#                       Cor <- cor(x, y, method = 'spearman', use = 'complete.obs')
+#                       cor_p = cor.test(x, y, method = 'spearman', use = 'complete.obs')$p.value
+#                       if(cor_p < 0.05){
+#                         txt <- paste0(prefix, format(c(Cor, 0.123456789), digits = digits)[1])
+#                       } else {
+#                         txt <- ''
+#                       }
+#                       if(missing(cex.cor)) {
+#                           cex.cor <- 0.4 / strwidth(txt)
+#                       }
+#                       text(0.5, 0.5, txt,
+#                            cex = 1 + cex.cor * abs(Cor)) # Resize the text by level of correlation
+#                     },
+#       diag.panel = function(x, ...) {
+#                      usr <- par("usr")
+#                      on.exit(par(usr))
+#                      par(usr = c(usr[1:2], 0, 1.5))
+#                      his <- hist(x, plot = FALSE)
+#                      breaks <- his$breaks
+#                      nB <- length(breaks)
+#                      y <- his$counts
+#                      y <- y/max(y)
+#                      rect(breaks[-nB], 0, breaks[-1], y, col = rgb(0, 1, 1, alpha = 0.5), ...)
+#                      # lines(density(x), col = 2, lwd = 2) # Uncomment to add density lines
+#                      }
+# )
+# 
+# # Reduced Dataset
+# pairs(pericarp_data %>%
+#         left_join(cor_data %>%
+#                     select(Sample_ID, Peelers)) %>%
+#         filter(Peelers %in% c('AG-AG', 'PH-PH')) %>%
+#         select(Pericarp_Retention,
+#                Kernel_Mass,
+#                Kernel_Volume,
+#                Kernel_Density,
+#                Initial_Pericarp_Quantity,
+#                Pericarp_Thickness) %>%
+#         mutate(mass_by_volume = Kernel_Mass * Kernel_Volume),
+#       upper.panel = function(x, y, digits = 2, prefix = "", cex.cor, ...) {
+#                       usr <- par("usr")
+#                       on.exit(par(usr))
+#                       par(usr = c(0, 1, 0, 1))
+#                       Cor <- cor(x, y, method = 'spearman', use = 'complete.obs')
+#                       cor_p = cor.test(x, y, method = 'spearman', use = 'complete.obs')$p.value
+#                       if(cor_p < 0.05){
+#                         txt <- paste0(prefix, format(c(Cor, 0.123456789), digits = digits)[1])
+#                       } else {
+#                         txt <- ''
+#                       }
+#                       if(missing(cex.cor)) {
+#                           cex.cor <- 0.4 / strwidth(txt)
+#                       }
+#                       text(0.5, 0.5, txt,
+#                            cex = 1 + cex.cor * abs(Cor)) # Resize the text by level of correlation
+#                     },
+#       diag.panel = function(x, ...) {
+#                      usr <- par("usr")
+#                      on.exit(par(usr))
+#                      par(usr = c(usr[1:2], 0, 1.5))
+#                      his <- hist(x, plot = FALSE)
+#                      breaks <- his$breaks
+#                      nB <- length(breaks)
+#                      y <- his$counts
+#                      y <- y/max(y)
+#                      rect(breaks[-nB], 0, breaks[-1], y, col = rgb(0, 1, 1, alpha = 0.5), ...)
+#                      # lines(density(x), col = 2, lwd = 2) # Uncomment to add density lines
+#                      }
+# )
+```
+
+Benchtop pericarp retention does not appear to be correlated with kernel mass, volume, or density, but does appear to be correlated with the initial pericarp quantity (0.53). The kernel mass and volume appear to be correlated which is a good check that we are correctly pairing samples.
+
+## Compositional Data Pairwise Plots
+```{r plot out data distributions and correlations with compositional data, message = FALSE, warning = FALSE}
+# Full Dataset
+paired_plot_comp = ggpairs(pair_cor_data %>%
+                            rename(`GK Protein` = Protein,
+                                   `GK Starch` = Starch,
+                                   `GK Fiber` = Fiber,
+                                   `GK Fat` = Fat,
+                                   `GK Ash` = Ash,
+                                   `WK Protein` = `Foss Protein`,
+                                   `WK Starch` = `Foss Starch`,
+                                   `WK Oil` = `Foss Oil`),
+        columns = c('GK Protein',
+                    'GK Starch',
+                    'GK Fiber',
+                    'GK Fat',
+                    'GK Ash',
+                    'WK Protein',
+                    'WK Starch',
+                    'WK Oil'),
+        diag = list(continuous = wrap('densityDiag', fill = 'gray')),
+        lower = list(continuous = wrap('smooth', se = F)),
+        upper = list(continuous = wrap("cor", size = 5, color = 'black')))+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'))
+
+paired_plot_comp
+
+ggsave('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/pairwise_plot_comp.png',
+       plot = paired_plot_comp,
+       width = 7.5,
+       height = 7.5,
+       dpi = 300)
+
+# pairs(pericarp_data %>%
+#         select(Pericarp_Retention,
+#                Protein,
+#                Starch,
+#                Fiber,
+#                Fat,
+#                Ash),
+#       upper.panel = function(x, y, digits = 2, prefix = "", cex.cor, ...) {
+#                       usr <- par("usr")
+#                       on.exit(par(usr))
+#                       par(usr = c(0, 1, 0, 1))
+#                       Cor <- cor(x, y, method = 'spearman', use = 'complete.obs')
+#                       cor_p = cor.test(x, y, method = 'spearman', use = 'complete.obs')$p.value
+#                       if(cor_p < 0.05){
+#                         txt <- paste0(prefix, format(c(Cor, 0.123456789), digits = digits)[1])
+#                       } else {
+#                         txt <- ''
+#                       }
+#                       if(missing(cex.cor)) {
+#                           cex.cor <- 0.4 / strwidth(txt)
+#                       }
+#                       text(0.5, 0.5, txt,
+#                            cex = 1 + cex.cor * abs(Cor)) # Resize the text by level of correlation
+#                     },
+#       diag.panel = function(x, ...) {
+#                      usr <- par("usr")
+#                      on.exit(par(usr))
+#                      par(usr = c(usr[1:2], 0, 1.5))
+#                      his <- hist(x, plot = FALSE)
+#                      breaks <- his$breaks
+#                      nB <- length(breaks)
+#                      y <- his$counts
+#                      y <- y/max(y)
+#                      rect(breaks[-nB], 0, breaks[-1], y, col = rgb(0, 1, 1, alpha = 0.5), ...)
+#                      # lines(density(x), col = 2, lwd = 2) # Uncomment to add density lines
+#                      }
+# )
+# 
+# # Reduced Dataset
+# pairs(pericarp_data %>%
+#         left_join(cor_data %>%
+#                     select(Sample_ID, Peelers)) %>%
+#         filter(Peelers %in% c('AG-AG', 'PH-PH')) %>%
+#         select(Pericarp_Retention,
+#                Foss_Protein,
+#                Protein,
+#                Starch,
+#                Fiber,
+#                Fat,
+#                Ash),
+#       upper.panel = function(x, y, digits = 2, prefix = "", cex.cor, ...) {
+#                       usr <- par("usr")
+#                       on.exit(par(usr))
+#                       par(usr = c(0, 1, 0, 1))
+#                       Cor <- cor(x, y, method = 'spearman', use = 'complete.obs')
+#                       cor_p = cor.test(x, y, method = 'spearman', use = 'complete.obs')$p.value
+#                       if(cor_p < 0.05){
+#                         txt <- paste0(prefix, format(c(Cor, 0.123456789), digits = digits)[1])
+#                       } else {
+#                         txt <- ''
+#                       }
+#                       if(missing(cex.cor)) {
+#                           cex.cor <- 0.4 / strwidth(txt)
+#                       }
+#                       text(0.5, 0.5, txt,
+#                            cex = 1 + cex.cor * abs(Cor)) # Resize the text by level of correlation
+#                     },
+#       diag.panel = function(x, ...) {
+#                      usr <- par("usr")
+#                      on.exit(par(usr))
+#                      par(usr = c(usr[1:2], 0, 1.5))
+#                      his <- hist(x, plot = FALSE)
+#                      breaks <- his$breaks
+#                      nB <- length(breaks)
+#                      y <- his$counts
+#                      y <- y/max(y)
+#                      rect(breaks[-nB], 0, breaks[-1], y, col = rgb(0, 1, 1, alpha = 0.5), ...)
+#                      # lines(density(x), col = 2, lwd = 2) # Uncomment to add density lines
+#                      }
+# )
+```
+
+None of the compositional traits are particularly highly correlated with the benchtop pericarp retention value. The highest correlation is with ash content (0.47), though protein and fiber appear to be positively correlated with pericarp retention, and starch content appears to be negatively correlated. The negative correlation between starch and protein is a good sanity check for our compositional data.
+
+## Shape Data Pairwise Plots
+```{r plot out data distributions and correlations with shape data, message = FALSE, warning = FALSE}
+# Full Dataset
+paired_plot_shape = ggpairs(pair_cor_data,
+        columns = c('Pericarp Retention',
+                    'Area',
+                    'Perimeter',
+                    'Length',
+                    'Width',
+                    'Circularity',
+                    'Rectangularity'),
+        diag = list(continuous = wrap('densityDiag', fill = 'gray')),
+        lower = list(continuous = wrap('smooth', se = F)),
+        upper = list(continuous = wrap("cor", size = 5, color = 'black')))+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'))
+
+paired_plot_shape
+
+# pairs(pericarp_data %>%
+#         filter(Sample_ID != 'YCH23:2519') %>%
+#         select(Pericarp_Retention,
+#                Area,
+#                Perimeter,
+#                Length,
+#                Width,
+#                Circularity,
+#                Rectangularity,
+#                Solidity),
+#       upper.panel = function(x, y, digits = 2, prefix = "", cex.cor, ...) {
+#                       usr <- par("usr")
+#                       on.exit(par(usr))
+#                       par(usr = c(0, 1, 0, 1))
+#                       Cor <- cor(x, y, method = 'spearman', use = 'complete.obs')
+#                       cor_p = cor.test(x, y, method = 'spearman', use = 'complete.obs')$p.value
+#                       if(cor_p < 0.05){
+#                         txt <- paste0(prefix, format(c(Cor, 0.123456789), digits = digits)[1])
+#                       } else {
+#                         txt <- ''
+#                       }
+#                       if(missing(cex.cor)) {
+#                           cex.cor <- 0.4 / strwidth(txt)
+#                       }
+#                       text(0.5, 0.5, txt,
+#                            cex = 1 + cex.cor * abs(Cor)) # Resize the text by level of correlation
+#                     },
+#       diag.panel = function(x, ...) {
+#                      usr <- par("usr")
+#                      on.exit(par(usr))
+#                      par(usr = c(usr[1:2], 0, 1.5))
+#                      his <- hist(x, plot = FALSE)
+#                      breaks <- his$breaks
+#                      nB <- length(breaks)
+#                      y <- his$counts
+#                      y <- y/max(y)
+#                      rect(breaks[-nB], 0, breaks[-1], y, col = rgb(0, 1, 1, alpha = 0.5), ...)
+#                      # lines(density(x), col = 2, lwd = 2) # Uncomment to add density lines
+#                      }
+# )
+# 
+# # Reduced Dataset
+# pairs(pericarp_data %>%
+#         left_join(cor_data %>%
+#                     select(Sample_ID, Peelers)) %>%
+#         filter(Peelers %in% c('AG-AG', 'PH-PH')) %>%
+#         filter(Sample_ID != 'YCH23:2519') %>%
+#         select(Pericarp_Retention,
+#                Area,
+#                Perimeter,
+#                Length,
+#                Width,
+#                Circularity,
+#                Rectangularity,
+#                Solidity),
+#       upper.panel = function(x, y, digits = 2, prefix = "", cex.cor, ...) {
+#                       usr <- par("usr")
+#                       on.exit(par(usr))
+#                       par(usr = c(0, 1, 0, 1))
+#                       Cor <- cor(x, y, method = 'spearman', use = 'complete.obs')
+#                       cor_p = cor.test(x, y, method = 'spearman', use = 'complete.obs')$p.value
+#                       if(cor_p < 0.05){
+#                         txt <- paste0(prefix, format(c(Cor, 0.123456789), digits = digits)[1])
+#                       } else {
+#                         txt <- ''
+#                       }
+#                       if(missing(cex.cor)) {
+#                           cex.cor <- 0.4 / strwidth(txt)
+#                       }
+#                       text(0.5, 0.5, txt,
+#                            cex = 1 + cex.cor * abs(Cor)) # Resize the text by level of correlation
+#                     },
+#       diag.panel = function(x, ...) {
+#                      usr <- par("usr")
+#                      on.exit(par(usr))
+#                      par(usr = c(usr[1:2], 0, 1.5))
+#                      his <- hist(x, plot = FALSE)
+#                      breaks <- his$breaks
+#                      nB <- length(breaks)
+#                      y <- his$counts
+#                      y <- y/max(y)
+#                      rect(breaks[-nB], 0, breaks[-1], y, col = rgb(0, 1, 1, alpha = 0.5), ...)
+#                      # lines(density(x), col = 2, lwd = 2) # Uncomment to add density lines
+#                      }
+# )
+```
+
+There doesn't appear to be any correlation between the shape data collected from image analysis and the benchtop pericarp retention value. The strongest relationships are with circularity (-0.29) and solidity (-0.35). These seem to be largely driven by a small number of relatively extreme values with relatively high leverage. It doesn't appear that the shape of the kernels has a strong relationship with pericarp retention.
+
+# Modeling Pericarp Retention with Physical Factors
+## Feature selection for pericarp retention from physical factors
+```{r feature selection for pericarp retention from physical factors, message = FALSE, warning = FALSE}
+related_data = ych_foss_spec_clean %>%
+  select(-c(Genotype)) %>%
+  filter(Sample_ID %in% pair_cor_data$`Sample ID`) %>%
+  left_join(pair_cor_data %>%
+              rename(`Ground Kernel Protein` = Protein,
+                                 `Ground Kernel Starch` = Starch,
+                                 `Ground Kernel Fiber` = Fiber,
+                                 `Ground Kernel Fat` = Fat,
+                                 `Ground Kernel Ash` = Ash,
+                                 `Whole Kernel Protein` = `Foss Protein`,
+                                 `Whole Kernel Starch` = `Foss Starch`,
+                                 `Whole Kernel Oil` = `Foss Oil`) %>%
+              select(`Sample ID`, `Pericarp Retention`,
+                     `Initial Pericarp Quantity`, `Ground Kernel Protein`,
+                     `Ground Kernel Starch`, `Ground Kernel Fiber`,
+                     `Ground Kernel Ash`, `Ground Kernel Fat`,
+                     `Whole Kernel Protein`, `Whole Kernel Starch`,
+                     `Whole Kernel Oil`,`Kernel Mass`, `Kernel Volume`,
+                     `Kernel Density`,Perimeter, Length, Circularity,
+                     Area, Width, Rectangularity),
+            by = c('Sample_ID' = 'Sample ID'))
+
+imputation_model = preProcess(as.data.frame(related_data), 'knnImpute')
+related_data = predict(imputation_model, related_data)
+
+# Because many of these features are correlated with each other (particularly the spectra), I think it would be a good idea to create a pls model and look at the most important features.
+var_imp_data = tibble()
+for(rep in 1:100){
+  #set.seed(rep)
+  model = train(`Pericarp Retention` ~ .,
+                  data = related_data %>%
+                    select(-Sample_ID, -as.character(seq(400, 1095,5))),
+                  method = "glmnet", 
+                  metric = "Rsquared",
+                  #preProcess = c('center', 'scale'),
+                  #tuneGrid = expand.grid(ncomp = 1:10),
+                  trControl = trainControl(method = 'cv', number = 5))
+
+var_imp_data = var_imp_data %>%
+  bind_rows(varImp(model, scale = F)$importance %>%
+              rownames_to_column('Feature') %>%
+              rename('Importance' = Overall) %>%
+              mutate(Feature = str_remove_all(Feature, '[\\\\`]'),
+                     Group = case_when(Feature == 'Initial Pericarp Quantity' ~ 'Morphological',
+                                       Feature == 'Ground Kernel Protein' ~ 'Compositional',
+                                       Feature == 'Ground Kernel Starch' ~ 'Compositional',
+                                       Feature == 'Ground Kernel Fiber' ~ 'Compositional',
+                                       Feature == 'Ground Kernel Ash' ~ 'Compositional',
+                                       Feature == 'Ground Kernel Fat' ~ 'Compositional',
+                                       Feature == 'Whole Kernel Protein' ~ 'Compositional',
+                                       Feature == 'Whole Kernel Starch' ~ 'Compositional',
+                                       Feature == 'Whole Kernel Oil' ~ 'Compositional',
+                                       Feature == 'Perimeter' ~ 'Morphological',
+                                       Feature == 'Length' ~ 'Morphological',
+                                       Feature == 'Area' ~ 'Morphological',
+                                       Feature == 'Width' ~ 'Morphological',
+                                       Feature == 'Rectangularity' ~ 'Morphological',
+                                       Feature == 'Circularity' ~ 'Morphological',
+                                       Feature == 'Kernel Mass' ~ 'Morphological',
+                                       Feature == 'Kernel Volume' ~ 'Morphological',
+                                       Feature == 'Kernel Density' ~ 'Morphological',
+                                       TRUE ~ 'Spectral')) %>%
+              mutate(Rep = rep,
+                     Accuracy = max(model$results$Rsquared)))
+}
+
+var_imp_plot = var_imp_data %>%
+  #mutate(Normalized_Imp = Importance * Accuracy) %>% # Weigh the more accurate models more highly
+  group_by(Feature, Group) %>%
+  summarise(Importance = mean(Importance)) %>%
+  ggplot(aes(x = reorder(Feature, Importance), y = Importance))+
+  geom_bar(stat = 'identity', show.legend = F, fill = 'black')+
+  coord_flip()+
+  labs(x = NULL,
+       tag = 'B')+
+  facet_wrap(~Group, scales = 'free_y', ncol = 1)+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'))
+
+var_imp_plot
+
+ggsave('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/var_imp_plot.png',
+       plot = var_imp_plot,
+       width = 3.75,
+       height = 3.5,
+       dpi = 300)
+```
+
+## Look at all pairwise comparisons
+```{r pairwise comparisons, echo=FALSE}
+pairwise_cor_data = cor(pair_cor_data %>%
+                          rename(`Ground Kernel Protein` = Protein,
+                                 `Ground Kernel Starch` = Starch,
+                                 `Ground Kernel Fiber` = Fiber,
+                                 `Ground Kernel Fat` = Fat,
+                                 `Ground Kernel Ash` = Ash,
+                                 `Whole Kernel Protein` = `Foss Protein`,
+                                 `Whole Kernel Starch` = `Foss Starch`,
+                                 `Whole Kernel Oil` = `Foss Oil`) %>%
+      select(-`Sample ID`, -Solidity, -`Benchtop Image Rating`,
+             -`Rapid Image Rating`, -`Rapid Pericarp Retention`),
+    use = 'complete.obs') %>%
+  as_tibble() %>%
+  mutate(Feature = colnames(.), .before = 1)
+
+pairwise_cor_plot = pairwise_cor_data %>%
+  pivot_longer(cols = -Feature,
+               names_to = 'Comparison',
+               values_to = 'Correlation') %>%
+  mutate(Feature = factor(Feature, levels = c('Pericarp Retention',
+                     'Ground Kernel Protein', 'Ground Kernel Starch',
+                     'Ground Kernel Fiber', 'Ground Kernel Ash',
+                     'Ground Kernel Fat', 'Whole Kernel Protein',
+                     'Whole Kernel Starch', 'Whole Kernel Oil',
+                     'Initial Pericarp Quantity', 'Kernel Mass', 
+                     'Kernel Volume', 'Kernel Density',
+                     'Perimeter', 'Length', 'Circularity',
+                     'Area', 'Width', 'Rectangularity')),
+         Comparison = factor(Comparison, levels = rev(c('Pericarp Retention',
+                     'Ground Kernel Protein', 'Ground Kernel Starch',
+                     'Ground Kernel Fiber', 'Ground Kernel Ash',
+                     'Ground Kernel Fat', 'Whole Kernel Protein',
+                     'Whole Kernel Starch', 'Whole Kernel Oil',
+                     'Initial Pericarp Quantity', 'Kernel Mass', 
+                     'Kernel Volume', 'Kernel Density',
+                     'Perimeter', 'Length', 'Circularity',
+                     'Area', 'Width', 'Rectangularity')))) %>%
+  ggplot(aes(x = Feature, y = Comparison, fill = Correlation))+
+  geom_tile(color = 'white')+
+  scale_fill_gradient2(low = 'blue', mid = 'white', high = 'red',
+                       midpoint = 0, limit = c(-1, 1), space = 'Lab',
+                       name = 'Correlation')+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_text(angle = 45, hjust = 1),
+        legend.position = 'bottom',
+        legend.margin = unit(c(0,0,0,0), 'in'))+
+  labs(x = NULL,
+       y = NULL,
+       tag = 'A')#+
+  #scale_x_discrete(limits = rev(levels(pairwise_cor_data$Feature)))+
+  #scale_y_discrete(limits = rev(levels(pairwise_cor_data$Comparison)))+
+  #guides(fill = guide_colorbar(barwidth = 10, barheight = 1,
+  #                             title.position = 'top',
+  #                             title.hjust = 0.5,
+  #                             label.position = 'bottom',
+  #                             label.hjust = 0.5))
+
+pairwise_cor_plot
+
+ggsave('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/pairwise_cor_data.png',
+       plot = pairwise_cor_plot,
+       width = 3.75,
+       height = 4.5,
+       dpi = 300)
+
+
+```
+
+The variables do not do a good job modeling pericarp retention (RMSE = 0.49, maximum PVE ~ 48%).  However, based on the model above, it appears that the compositional traits (ash specifically) and some morphological traits (initial pericarp quantity and circularity) are the most important features in the model. There is a notable gap in the feature importance between the most important compositional and morphological traits and the spectral traits. This could indicate that composition of the pericarp is important, to a slightly lesser extent the quantity of that pericarp plays an important role as well, that shape charactersitics are mildly important, and that the spectra that are most highly correlated are not enough to represent the chemical diversity. It could also be related to the data we chose, which were the most highly correlated (hopefully not too redundant) factors with pericarp retention.
+
+
+## Create a table of significant results
+```{r create table of significant results, message = FALSE, warning = FALSE}
+pericarp_data_updated = pair_cor_data
+
+storage_table = tibble()
+for(trait in colnames(pericarp_data_updated)[-c(1:2)]){
+  results = cor.test(pericarp_data_updated$`Pericarp Retention`,
+                     pericarp_data_updated[[trait]],
+                     method = 'spearman',
+                     use = 'complete.obs')
+  
+  storage_table = storage_table %>%
+      bind_rows(tibble(Trait = trait,
+                       Rs = results$estimate,
+                       P_Value = results$p.value))
+}
+
+storage_table %>%
+  arrange(P_Value) %>%
+  mutate(MTC_Sig = case_when(P_Value < 0.05/23 ~ 'Yes',
+         P_Value >= 0.05/23 ~ 'No')) %>%
+  write_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/cors_table.csv')
+```
+
+## Create a plot of promising associations
+```{r promising assocations, message = FALSE, warning = FALSE}
+paired_plot_sig = ggpairs(pair_cor_data,
+        columns = c('Pericarp Retention',
+                    'Initial Pericarp Quantity', 
+                    'Ash'),
+        diag = list(continuous = wrap('densityDiag', fill = 'gray')),
+        lower = list(continuous = wrap('smooth', se = F)),
+        upper = list(continuous = wrap("cor", size = 5, color = 'black')))+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'))
+
+paired_plot_sig
+
+ggsave('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/paired_plot_sig.png',
+       plot = paired_plot_sig,
+       width = 3.75,
+       height = 3.75,
+       dpi = 300)
+
+cor_to_bench_plot = pair_cor_data %>%
+  select('Pericarp Retention',
+         'Initial Pericarp Quantity',
+         'Ash') %>%
+  rename(`log(Benchtop Pericarp Retention)` = `Pericarp Retention`,
+         `Ground Kernel Ash` = Ash) %>%
+  pivot_longer(cols = -`log(Benchtop Pericarp Retention)`,
+               names_to = 'Trait',
+               values_to = 'Value') %>%
+  mutate(Trait = factor(Trait, levels = c('Initial Pericarp Quantity',
+                                          'Ground Kernel Ash'))) %>%
+  ggplot(aes(x = Value, y = `log(Benchtop Pericarp Retention)`))+
+  geom_point()+
+  geom_smooth(method = 'lm', se = F, color = 'black')+
+  ggpubr::stat_cor(method = 'spearman',
+                   show.legend = F,
+                   label.sep = '\n',
+                   label.x.npc = 0.6,
+                   label.y.npc = 0.12)+
+  labs(x = NULL,
+       y = 'log(Benchtop Cook Pericarp Retention)')+
+  facet_wrap(~Trait, scales = 'free')+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'))
+
+cor_to_bench_plot
+
+ggsave('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/cor_to_bench_plot.png',
+       plot = cor_to_bench_plot,
+       width = 7.5,
+       height = 3.5,
+       dpi = 300)
+```
+
+## Spectra associated with pericarp thickness
+```{r spectra associated with pericarp thickness, message = FALSE, warning = FALSE}
+ych_foss_spec_clean %>%
+  filter(Sample_ID %in% pericarp_data$Sample_ID) %>%
+  left_join(pericarp_data %>%
+              select(Sample_ID, Pericarp_Retention),
+            by = 'Sample_ID') %>%
+  pivot_longer(cols = -c(Sample_ID, Genotype, Pericarp_Retention),
+               names_to = 'Wavelength',
+               values_to = 'Absorbance') %>%
+  mutate(Wavelength = as.numeric(Wavelength)) %>%
+  group_by(Wavelength) %>% 
+  summarize(Correlation = cor(Absorbance, log(Pericarp_Retention), use = 'complete.obs')) %>%
+  left_join(var_imp_data %>%
+              mutate(Feature = as.numeric(Feature)),
+            by = c('Wavelength' = 'Feature')) %>%
+  ggplot(aes(x = Wavelength, y = abs(Correlation), color = Importance))+
+  geom_point()+
+  geom_vline(xintercept = c(615, 665, 925, 1000))+
+  labs(x = 'Wavelength',
+       y = '|Correlation with Pericarp Retention|',
+       title = 'All-feature model')+
+  theme_classic()
+
+# ych_foss_spec_clean %>%
+#   filter(Sample_ID %in% pericarp_data$Sample_ID) %>%
+#   left_join(pericarp_data %>%
+#               select(Sample_ID, Pericarp_Retention),
+#             by = 'Sample_ID') %>%
+#   pivot_longer(cols = -c(Sample_ID, Genotype, Pericarp_Retention),
+#                names_to = 'Wavelength',
+#                values_to = 'Absorbance') %>%
+#   mutate(Wavelength = as.numeric(Wavelength)) %>%
+#   group_by(Wavelength) %>% 
+#   summarize(Correlation = cor(Absorbance, log(Pericarp_Retention), use = 'complete.obs')) %>%
+#   left_join(var_imp_spectra %>%
+#               mutate(Feature = as.numeric(Feature)),
+#             by = c('Wavelength' = 'Feature')) %>%
+#   ggplot(aes(x = Wavelength, y = abs(Correlation), color = Importance))+
+#   geom_point()+
+#   geom_vline(xintercept = c(615, 665, 925, 1000))+
+#   labs(x = 'Wavelength',
+#        y = '|Correlation with Pericarp Retention|',
+#        title = 'Spectra-only model')+
+#   theme_classic()
+```
+
+It looks like there are roughly 4 peaks that form near or above 0.2. These are likely highly correlated with each other, but we will pull these as representing compositional attributes related to pericarp retention. We can also utilize a few shape characteristics and the pericarp thickness proxy to build a model to assess variation explained in pericarp retention.
+
+# Validating Findings
+This assessment is indicating that rapid cooks will not be a sufficient proxy to train a machine learning model with if our goal is to predict benchtop cooking performance.  We are however seeing some potential biological signals that we should pay closer attention to.
+
+## Ash, Fiber, and Protein Content
+The primary biological signals are ash content, protein content, initial pericarp quantity, and kernel perimeter. Technically, fiber is significantly associated in the full dataset, but when samples with high error are removed, this signal disappears. This suggests that fiber might not actually be playing a role in this small population, and a few high error samples were driving the relationship.
+
+To validate ash content and protein content, we are going to pull samples that are on the high and low tails of WiDiv hybrids and perform a two sample t-test on the pericarp retained values. To do this, we will need to determine a sample number for each group. We will do this through power analysis, which requires an estimate of delta and the standard deviation. We will get both of these from the current dataset and plug it in with a few different values of power from 0.8 to 0.95 to determine the number of samples we need to pull.
+
+### Power Analysis for Ash Content
+```{r power analysis for ash content, message = FALSE, warning = FALSE}
+# Estimate delta
+top_10_ash = pericarp_data %>%
+  arrange(desc(Ash)) %>%
+  head(10) %>%
+  pull(Pericarp_Retention)
+
+bottom_10_ash = pericarp_data %>%
+  arrange(Ash) %>%
+  head(10) %>%
+  pull(Pericarp_Retention)
+
+delta_ash = mean(top_10_ash) - mean(bottom_10_ash)
+
+sd_ash = sd(pericarp_data$Pericarp_Retention)
+
+power_level = c()
+n_samples = c()
+for(power in seq(0.5, 0.99, 0.01)){
+  n = ceiling(power.t.test(delta = delta_ash,
+               sd = sd_ash,
+               sig.level = 0.05,
+               power = power)$n)
+  
+  power_level = c(power_level, power)
+  n_samples = c(n_samples, n)
+}
+
+plot(power_level, n_samples, type = 'b', xlab = 'Power Level', ylab = 'Number of Samples')
+
+power.t.test(delta = delta_ash,
+               sd = sd_ash,
+               sig.level = 0.05,
+               n = 20)
+```
+
+According to this power analysis, we can cook 15 samples per group (30 samples total) to achieve a power of 80% and 20 samples per group (40 samples total) to acheive a power of 90%.
+
+### Power Analysis for Fiber Content
+```{r power analysis for fiber content, message = FALSE, warning = FALSE}
+# Estimate delta
+top_10_fiber = pericarp_data %>%
+  arrange(desc(Fiber)) %>%
+  head(10) %>%
+  pull(Pericarp_Retention)
+
+bottom_10_fiber = pericarp_data %>%
+  arrange(Fiber) %>%
+  head(10) %>%
+  pull(Pericarp_Retention)
+
+delta_fiber = mean(top_10_fiber) - mean(bottom_10_fiber)
+sd_fiber = sd(pericarp_data$Pericarp_Retention)
+
+power_level = c()
+n_samples = c()
+
+for(power in seq(0.5, 0.99, 0.01)){
+  n = ceiling(power.t.test(delta = delta_fiber,
+               sd = sd_fiber,
+               sig.level = 0.05,
+               power = power)$n)
+  
+  power_level = c(power_level, power)
+  n_samples = c(n_samples, n)
+}
+
+plot(power_level, n_samples, type = 'b', xlab = 'Power Level', ylab = 'Number of Samples')
+
+power.t.test(delta = delta_fiber,
+               sd = sd_fiber,
+               sig.level = 0.05,
+               n = 20)
+```
+
+### Power Analysis for Protein Content
+```{r power analysis for protein content, message = FALSE, warning = FALSE}
+# Estimate delta
+top_10_protein = pericarp_data %>%
+  arrange(desc(Protein)) %>%
+  head(10) %>%
+  pull(Pericarp_Retention)
+
+bottom_10_protein = pericarp_data %>%
+  arrange(Protein) %>%
+  head(10) %>%
+  pull(Pericarp_Retention)
+
+delta_protein = mean(top_10_protein) - mean(bottom_10_protein)
+
+sd_protein = sd(pericarp_data$Pericarp_Retention)
+
+power_level = c()
+n_samples = c()
+for(power in seq(0.5, 0.99, 0.01)){
+  n = ceiling(power.t.test(delta = delta_protein,
+               sd = sd_protein,
+               sig.level = 0.05,
+               power = power)$n)
+  
+  power_level = c(power_level, power)
+  n_samples = c(n_samples, n)
+}
+
+plot(power_level, n_samples, type = 'b', xlab = 'Power Level', ylab = 'Number of Samples')
+
+power.t.test(delta = delta_protein,
+               sd = sd_protein,
+               sig.level = 0.05,
+               n = 20)
+```
+
+It appears again that 15 samples per group will provide a power of 80% and 20 samples per group will provide a power of 90%. We will proceed by selecting the top and bottom 30 samples for ash and protein content to ensure we have enough back up samples.
+
+#### Select top and bottom 30 ash samples
+```{r select top and bottom 30 ash samples, message = FALSE, warning = FALSE}
+# Read in perten data
+ych_perten = read_csv('~/Desktop/Grad_School/Research/CHIP-NMC/Data/Scans/Hybrid_Maize_Composition_Predictions.csv') %>%
+  filter(str_detect(Sample_ID, '^YCH22')) %>%
+  mutate(Egg = str_remove(str_extract(Genotype, '.* X '),
+                          ' X $'),
+         Pollen = case_when(str_detect(Genotype,
+                                       ' X B73') ~ 'B73',
+                            str_detect(Genotype,
+                                       ' X Mo17') ~ 'Mo17',
+                            str_detect(Genotype,
+                                       ' X LH244') ~ 'LH244'),
+         Year = case_when(str_detect(Sample_ID,
+                                    'YCH22') ~ '2022',
+                          str_detect(Sample_ID,
+                                    'YCH23') ~ '2023'),
+         .before = 3) %>%
+  filter(!is.na(Pollen),
+         !is.na(Egg))
+
+ash_high_samples = ych_perten %>%
+  arrange(desc(Ash)) %>%
+  distinct(Egg,
+           .keep_all = T) %>%
+  group_by(Pollen) %>%
+  slice(1:30)
+
+ash_high_samples %>%
+  group_by(Pollen) %>%
+  summarize(n = n())
+
+ash_low_samples = ych_perten %>%
+  arrange(Ash) %>%
+  distinct(Egg,
+           .keep_all = T) %>%
+  group_by(Pollen) %>%
+  slice(1:30)
+
+ash_low_samples %>%
+  group_by(Pollen) %>%
+  summarize(n = n())
+
+print(min(ash_high_samples$Ash) - max(ash_low_samples$Ash))
+print(mean(ash_high_samples$Ash) - mean(ash_low_samples$Ash))
+
+ash_hilo_samples = ash_high_samples %>%
+  mutate(Trait = 'Ash',
+         Group = 'High') %>%
+  bind_rows(ash_low_samples %>%
+  mutate(Trait = 'Ash',
+         Group = 'Low'))
+```
+
+#### Select the top and bottom 30 fiber samples
+```{r select top and bottom 30 fiber samples, message = FALSE, warning = FALSE}
+fiber_high_samples = ych_perten %>%
+  arrange(desc(Fiber)) %>%
+  distinct(Egg,
+           .keep_all = T) %>%
+  group_by(Pollen) %>%
+  slice(1:30)
+
+fiber_high_samples %>%
+  group_by(Pollen) %>%
+  summarize(n = n())
+
+fiber_low_samples = ych_perten %>%
+  arrange(Fiber) %>%
+  distinct(Egg,
+           .keep_all = T) %>%
+  group_by(Pollen) %>%
+  slice(1:30)
+
+fiber_low_samples %>%
+  group_by(Pollen) %>%
+  summarize(n = n())
+
+print(min(fiber_high_samples$Fiber) - max(fiber_low_samples$Fiber))
+print(mean(fiber_high_samples$Fiber) - mean(fiber_low_samples$Fiber))
+
+fiber_hilo_samples = fiber_high_samples %>%
+  mutate(Trait = 'Fiber',
+         Group = 'High') %>%
+  bind_rows(fiber_low_samples %>%
+  mutate(Trait = 'Fiber',
+         Group = 'Low'))
+```
+
+#### Select the top and bottom 30 protein samples
+```{r select top and bottom 30 protein samples, message = FALSE, warning = FALSE}
+protein_high_samples = ych_perten %>%
+  arrange(desc(Protein)) %>%
+  distinct(Egg,
+           .keep_all = T) %>%
+  group_by(Pollen) %>%
+  slice(1:35)
+
+protein_high_samples %>%
+  group_by(Pollen) %>%
+  summarize(n = n())
+
+protein_low_samples = ych_perten %>%
+  arrange(Protein) %>%
+  distinct(Egg,
+           .keep_all = T) %>%
+  group_by(Pollen) %>%
+  slice(1:30)
+
+protein_low_samples %>%
+  group_by(Pollen) %>%
+  summarize(n = n())
+
+print(min(protein_high_samples$Protein) - max(protein_low_samples$Protein))
+print(mean(protein_high_samples$Protein) - mean(protein_low_samples$Protein))
+
+protein_hilo_samples = protein_high_samples %>%
+  mutate(Trait = 'Protein',
+         Group = 'High') %>%
+  bind_rows(protein_low_samples %>%
+  mutate(Trait = 'Protein',
+         Group = 'Low'))
+```
+
+##### Determine if any of the above samples have already been cooked
+```{r determine if any of the above samples have already been cooked, message = FALSE, warning = FALSE}
+ash_hilo_samples %>%
+  filter(Sample_ID %in% pericarp_data$Sample_ID)
+protein_hilo_samples %>%
+  filter(Sample_ID %in% pericarp_data$Sample_ID)
+fiber_hilo_samples %>%
+  filter(Sample_ID %in% pericarp_data$Sample_ID)
+```
+
+##### Determine if there is any overlap between datasets
+```{r ash protein overlap samples, message = FALSE, warning = FALSE}
+ash_hilo_samples %>%
+  filter(Sample_ID %in% c(protein_hilo_samples$Sample_ID, 
+                          fiber_hilo_samples$Sample_ID))
+
+protein_hilo_samples %>%
+  filter(Sample_ID %in% c(ash_hilo_samples$Sample_ID, 
+                          fiber_hilo_samples$Sample_ID))
+
+fiber_hilo_samples %>%
+  filter(Sample_ID %in% c(ash_hilo_samples$Sample_ID, 
+                          protein_hilo_samples$Sample_ID))
+
+```
+
+### Create a list of high and low samples
+```{r create a list of high and low samples, message = FALSE, warning = FALSE}
+hilo_samples = ash_hilo_samples %>%
+  bind_rows(protein_hilo_samples) %>%
+  bind_rows(fiber_hilo_samples) %>%
+  select(Sample_ID, Group, Trait) %>%
+  group_by(Trait, Group) %>%
+  mutate(Group = paste(Group, row_number(), sep = '_')) %>%
+  pivot_wider(names_from = Trait,
+              values_from = Group) %>%
+  mutate(Already_Collected = case_when(Sample_ID %in% pericarp_data$Sample_ID ~ 'Yes',
+                                       TRUE ~ 'No')) %>%
+  left_join(read_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/High_Low_Comp_Samples_v3.csv') %>%
+              select(Sample_ID, Found, Enough_Seed),
+            by = 'Sample_ID') %>%
+  mutate(Found = case_when(Found == 'x' ~ 'x',
+                           TRUE ~ ''),
+         Enough_Seed = case_when(Enough_Seed == 'x' ~ 'x',
+                                 TRUE ~ ''))
+
+hilo_samples
+
+#hilo_samples %>%
+#  write_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/High_Low_Comp_Samples_v4.csv')
+```
+
+I have found the samples necessary. Let' verify that we have 10 for each group we are supposed to, and then let's create the spreadsheets necessary for their cooking labels.
+
+#### Verify that we have the correct number of samples
+```{r verify that we have the correct number of samples, message = FALSE, warning = FALSE}
+found_samples = read_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/High_Low_Comp_Samples_v3.csv') %>%
+  filter(using == 'x' | Already_Collected == 'Yes') %>%
+  select(Sample_ID, Pollen, Ash, Protein, Already_Collected)
+
+found_samples_fiber = read_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/High_Low_Comp_Samples_v4.csv') %>%
+  filter(Enough_Seed == 'x') %>%
+  select(Sample_ID, Pollen, Fiber)
+
+found_samples %>%
+  pivot_longer(cols = c(Ash, Protein),
+               names_to = 'Trait',
+               values_to = 'Group_Rank') %>%
+  separate(Group_Rank, into = c('Group', 'Rank'), sep = '_') %>%
+  arrange(Trait, Pollen, Group, as.numeric(Rank)) %>%
+  group_by(Trait, Pollen, Group) %>%
+  slice(1:10) %>%
+  summarize(n = n()) %>%
+  filter(!is.na(Group))
+```
+
+Great! These samples give us 10 high and low samples from each pollen parent for both ash and protein content. We can now create the cooking labels for these samples.
+
+### Cooking Labels - Ash and Protein
+```{r and and protein cooking labels, message = FALSE, warning = FALSE}
+ap_found_samples = found_samples %>%
+  filter(Already_Collected != 'Yes') %>%
+  select(Sample_ID, Ash, Protein) %>%
+  mutate(Ash = str_remove(Ash, '[a-z][a-z]_.*$'),
+         Protein = str_remove(Protein, '[a-z][a-z]_.*$'),
+         A = case_when(!is.na(Ash) ~'A',
+                       T ~ NA),
+         P = case_when(!is.na(Protein) ~'P',
+                       T ~ NA),
+         Group = str_remove_all(paste0(A, Ash, P, Protein), 'NA')) %>%
+  select(Sample_ID, Group)
+
+f_found_samples = found_samples_fiber %>%
+  select(Sample_ID, Fiber) %>%
+  mutate(Fiber = str_remove(Fiber, '[a-z][a-z]_.*$'),
+         F = case_when(!is.na(Fiber) ~'F',
+                       T ~ NA),
+         Group = str_remove_all(paste0(F, Fiber), 'NA')) %>%
+  select(Sample_ID, Group)
+
+set.seed(123)
+ap_cook_labels = ap_found_samples %>%
+  mutate(A = NA,
+         B = NA) %>%
+  pivot_longer(cols = c(A, B),
+               names_to = 'Hotplate_ID') %>%
+  select(-value) %>%
+  sample_frac(1) %>%
+  group_by(Hotplate_ID) %>%
+  mutate(Hotplate_Pos = rep_len(c(1:4), n())) %>%
+  group_by(Hotplate_ID, Hotplate_Pos) %>%
+  mutate(Cook_Day = row_number()) %>%
+  arrange(Cook_Day, Hotplate_ID, Hotplate_Pos)
+
+#ap_cook_labels %>%
+#  write_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/Ash_Protein_Cook_Labels.csv')
+
+ap_cook_labels %>%
+  mutate(Pericarp_1 = NA,
+        Pericarp_2 = NA,
+        Kernels_1 = NA,
+        Kernels_2 = NA) %>%
+  pivot_longer(cols = c(Pericarp_1, Pericarp_2, Kernels_1, Kernels_2),
+              names_to = 'Subsample') %>%
+  select(-value)# %>%
+  #write_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/Ash_Protein_Cook_Subsamples.csv')
+
+set.seed(123)
+f_cook_labels = f_found_samples %>%
+  mutate(A = NA,
+         B = NA) %>%
+  pivot_longer(cols = c(A, B),
+               names_to = 'Hotplate_ID') %>%
+  select(-value) %>%
+  sample_frac(1) %>%
+  group_by(Hotplate_ID) %>%
+  mutate(Hotplate_Pos = rep_len(c(1:4), n())) %>%
+  group_by(Hotplate_ID, Hotplate_Pos) %>%
+  mutate(Cook_Day = row_number()) %>%
+  arrange(Cook_Day, Hotplate_ID, Hotplate_Pos)
+
+# f_cook_labels %>%
+#   write_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/Fiber_Cook_Labels.csv')
+
+f_cook_labels %>%
+  mutate(Pericarp_1 = NA,
+         Pericarp_2 = NA,
+         Kernels_1 = NA,
+         Kernels_2 = NA) %>%
+  pivot_longer(cols = c(Pericarp_1, Pericarp_2, Kernels_1, Kernels_2),
+               names_to = 'Subsample') %>%
+  select(-value) #%>%
+  #write_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/Fiber_Cook_Subsamples.csv')
+```
+
+# FIBER STUFF START HERE NEXT
+
+## Initial Pericarp Quantity
+This was the strongest correlation with pericarp retention but is also one of the most difficult and time consuming to measure. We are going to screen 200 samples for their initial pericarp quantity and then select the top and bottom samples to perform a t-test on pericarp retention.
+
+### Power Analysis on Initial Pericarp Quantity
+```{r power analysis on initial pericarp quantity, message = FALSE, warning = FALSE}
+# Estimate delta
+top_10_ipq = pericarp_data %>%
+  arrange(desc(Initial_Pericarp_Quantity)) %>%
+  head(10) %>%
+  pull(Pericarp_Retention)
+
+bottom_10_ipq = pericarp_data %>%
+  arrange(Initial_Pericarp_Quantity) %>%
+  head(10) %>%
+  pull(Pericarp_Retention)
+
+delta_ipq = mean(top_10_ipq) - mean(bottom_10_ipq)
+
+sd_ipq = sd(pericarp_data$Pericarp_Retention)
+
+power_level = c()
+n_samples = c()
+for(power in seq(0.5, 0.99, 0.01)){
+  n = ceiling(power.t.test(delta = delta_ipq,
+               sd = sd_ipq,
+               sig.level = 0.05,
+               power = power)$n)
+  
+  power_level = c(power_level, power)
+  n_samples = c(n_samples, n)
+}
+
+plot(power_level, n_samples, type = 'b', xlab = 'Power Level', ylab = 'Number of Samples')
+
+power.t.test(delta = delta_ipq,
+               sd = sd_ipq,
+               sig.level = 0.05,
+               n = 15)
+```
+
+It looks like we can get 93% power with 15 samples per group. We will discuss if we want to maintain 20 samples per group, or just go with 15 to maintain estimated power.
+
+#### Selecting Screening Samples
+We are going to process 200 samples for initial pericarp quantity. We will then select the top and bottom 20 samples for a t-test on pericarp retention. To select the 200 samples, we will use the same method as we used to find the inital 60 samples used for method validation - spectral diversity. We will use honigs regression to find as many samples as we can that do not overlap egg parent, but given that there are only about 280 egg parents and that we will likely not have enough seed from many of them, we will create a long list of priority for each sample.
+
+```{r select screening samples, message = FALSE, warning = FALSE}
+snv_foss = ych_foss_spec_clean %>%
+  select(Sample_ID, Genotype) %>%
+  bind_cols(as_tibble(prospectr::standardNormalVariate(ych_foss_spec_clean[,-c(1:2)]))) %>%
+  separate(Genotype,
+           into = c('Egg_Parent', 'Pollen_Parent'),
+           sep = ' X ') %>%
+  mutate(Year = case_when(str_detect(Sample_ID,
+                                    'YCH22') ~ '2022',
+                          str_detect(Sample_ID,
+                                    'YCH23') ~ '2023'),
+         .before = `400`) %>%
+  filter(!Sample_ID %in% initial_data$Sample_ID)
+
+#Modifying copy of snv_normalization data frame
+snv_foss_copy <- snv_foss[snv_foss$Pollen_Parent %in% c('B73', 'Mo17', 'LH244'),]
+#snv_foss_copy_sub = snv_foss_copy
+#this needs to be run with each modification of the loop
+ipq_screen_selection = tibble()
+#for loop to select spectrally diverse samples that do not have the same egg parent as any other sample selected
+for(year in c('2022', '2023')){
+  pollen_parents = unique(snv_foss_copy$Pollen_Parent[snv_foss_copy$Year == year])
+  
+  for(p in pollen_parents){
+    print(paste('---', p, year, '---'))
+    for (i in 1:50) {
+      snv_foss_copy_sub <- snv_foss_copy[snv_foss_copy$Year == year &                                                         snv_foss_copy$Pollen_Parent == p,]
+
+      
+      result <- prospectr::honigs(snv_foss_copy_sub[,-c(1:4)], k = i+1, type = "A")
+      
+      #print(snv_foss_copy_sub[result$model[1:i],]$SampleID)
+      
+      egg_parent <- snv_foss_copy_sub[result$model[i], c(1:4)]
+      
+      ipq_screen_selection <- bind_rows(ipq_screen_selection, egg_parent)
+      
+      snv_foss_copy <- snv_foss_copy[snv_foss_copy$Egg_Parent != egg_parent$Egg_Parent | snv_foss_copy$Sample_ID == egg_parent$Sample_ID,]
+    }
+  }
+}
+
+length(unique(ipq_screen_selection$Sample_ID))
+length(unique(ipq_screen_selection$Egg_Parent))
+ipq_screen_selection %>%
+  group_by(Year, Pollen_Parent) %>%
+  summarize(n = n())
+
+ipq_screen_selection %>%
+  mutate(Genotype = paste(Egg_Parent, 'X', Pollen_Parent, sep = ' ')) %>%
+  select(Sample_ID, Genotype) %>%
+  mutate(Found = '',
+         Enough_Seed = '',
+         In_AP_Samples = case_when(Sample_ID %in% ap_found_samples$Sample_ID ~ 'x',
+                                   TRUE ~ '')) %>%
+  write_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/IPQ_Screening_Samples.csv')
+```
+
+##### Check the Spectral Diversity
+```{r check the spectral diversity, message = FALSE, warning = FALSE}
+ipq_sample_desig = snv_foss %>%
+  mutate(Group = case_when(Sample_ID %in% ipq_screen_selection$Sample_ID ~ 'Train',
+                           !Sample_ID %in% ipq_screen_selection$Sample_ID ~ 'Test'),
+         .before = `400`)
+
+#calculate PC
+pca_ipq_sample_desig <- prcomp(ipq_sample_desig[,6:145], center = T, scale. = T)
+#plot PC1 vs PC2
+ipq_sample_desig %>%
+  select(1:5) %>%
+  bind_cols(as_tibble(pca_ipq_sample_desig$x)) %>%
+  arrange(Group) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Group, shape = Year)) +
+  geom_point() +
+  scale_color_manual(values = c('red', 'black'), breaks = c('Train', 'Test')) +
+  labs(title = "PCA of Final Sample Selection") +
+  theme_classic()
+```
+
+##### Create the Peeling Labels
+```{r determine found samples, message = FALSE, warning = FALSE}
+ipq_screen_found_samples = read_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/IPQ_Screening_Samples.csv') %>%
+  select(Sample_ID, Genotype, Enough_Seed, In_AP_Samples) %>%
+  mutate(Year = case_when(str_detect(Sample_ID,
+                                    'YCH22') ~ '2022',
+                          str_detect(Sample_ID,
+                                    'YCH23') ~ '2023'),
+         Pollen_Parent = str_remove((str_extract(Genotype, 'X .*')), 'X '),
+         .before = 3) %>%
+  filter(Enough_Seed == 'x' | In_AP_Samples == 'x') %>%
+  group_by(Year, Pollen_Parent) %>%
+  slice(1:40) %>%
+  select(Sample_ID, Genotype, Year, Pollen_Parent)
+```
+
+```{r create peeling labels, message = FALSE, warning = FALSE}
+set.seed(123)
+ipq_screen_labels = ipq_screen_found_samples %>%
+  ungroup() %>%
+  sample_frac(1) %>%
+  mutate(Sample_Number = rep_len(c(1:20), n())) %>%
+  group_by(Sample_Number) %>%
+  mutate(Person_Days = row_number()) %>%
+  write_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/IPQ_Screening_Labels.csv')
+
+ipq_screen_labels %>%
+  mutate(Pericarp = NA,
+         Kernels = NA) %>%
+  pivot_longer(cols = c(Pericarp, Kernels),
+              names_to = 'Subsample') %>%
+  select(-value) %>%
+  arrange(Person_Days, Subsample, Sample_Number) %>%
+  write_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/IPQ_Screening_Subsamples.csv')
+```
+
+##### Select the top and bottom 20 ipq samples
+```{r select top and bottom 20 ipq samples, message = FALSE, warning = FALSE}
+# Read in screening data
+ipq_screen = read_csv('~/Downloads/Pericarp_Retention_Methods_Validation - Initial_Pericarp_Screening.csv') %>%
+  separate(Genotype,
+           into = c('Egg', 'Pollen'),
+           sep = ' X ') %>%
+  mutate(Year = case_when(str_detect(Sample_ID,
+                                    'YCH22') ~ '2022',
+                          str_detect(Sample_ID,
+                                    'YCH23') ~ '2023'),
+         .before = 2)
+
+# Check the distribution of pericarp quantity
+hist(ipq_screen$Normalized_Pericarp_Mass) # roughly normal!
+
+# Check that row number does not correlate with pericarp quantity
+# Color the plot by Date_Peel as a factor
+plot(ipq_screen$Normalized_Pericarp_Mass, c(1:nrow(ipq_screen)), col = as.factor(ipq_screen$Date_Peel))
+# There doesn't appear to be a relationship between row number and pericarp quantity - great!
+```
+
+##### Select the top and bottom 20 ipq samples
+```{r select top and bottom 20 ipq samples, message = FALSE, warning = FALSE}
+ipq_high_samples = ipq_screen %>%
+  filter(Sample_ID != 'YCH22:2468',
+         Sample_ID != 'YCH22:2580',
+         Sample_ID != 'YCH22:1447',
+         Sample_ID != 'YCH22:1306') %>%
+  arrange(desc(Normalized_Pericarp_Mass)) %>%
+  distinct(Egg,
+           .keep_all = T) %>%
+  group_by(Pollen, Year) %>%
+  slice(1:4)
+
+ipq_high_samples %>%
+  group_by(Pollen, Year) %>%
+  summarize(n = n())
+
+ipq_low_samples = ipq_screen %>%
+  filter(Sample_ID != 'YCH22:2468',
+         Sample_ID != 'YCH22:2580') %>%
+  arrange(Normalized_Pericarp_Mass) %>%
+  distinct(Egg,
+           .keep_all = T) %>%
+  group_by(Pollen, Year) %>%
+  slice(1:4)
+
+ipq_low_samples %>%
+  group_by(Pollen, Year) %>%
+  summarize(n = n())
+
+print(min(ipq_high_samples$Normalized_Pericarp_Mass) - max(ipq_low_samples$Normalized_Pericarp_Mass))
+print(mean(ipq_high_samples$Normalized_Pericarp_Mass) - mean(ipq_low_samples$Normalized_Pericarp_Mass))
+
+ipq_hilo_samples = ipq_high_samples %>%
+  mutate(Trait = 'IPQ',
+         Group = 'High') %>%
+  bind_rows(ipq_low_samples %>%
+  mutate(Trait = 'IPQ',
+         Group = 'Low'))
+```
+
+##### Determine if any of the IPQ samples have already been cooked
+```{r determine if any of the IPQ samples have already been cooked, message = FALSE, warning = FALSE}
+ipq_hilo_samples %>%
+  filter(Sample_ID %in% pericarp_data$Sample_ID)
+```
+
+##### Determine if there is any overlap between datasets with IPQ
+```{r ash protein overlap samples with IPQ, message = FALSE, warning = FALSE}
+ipq_hilo_samples %>%
+  filter(Sample_ID %in% protein_hilo_samples$Sample_ID | Sample_ID %in% ash_hilo_samples$Sample_ID)
+```
+
+We are going to recook these samples (if there is enough seed) because we are switching peelers.
+
+### Cooking Labels - IPQ
+```{r IPQ cooking labels, message = FALSE, warning = FALSE}
+ipq_samples = ipq_hilo_samples %>%
+  #filter(!(Sample_ID %in% protein_hilo_samples$Sample_ID | Sample_ID %in% ash_hilo_samples$Sample_ID)) %>%
+  select(Sample_ID, Pollen, Year) %>%
+  ungroup()
+
+set.seed(123)
+ipq_cook_labels = ipq_samples %>%
+  mutate(A = NA,
+         B = NA) %>%
+  pivot_longer(cols = c(A, B),
+               names_to = 'Hotplate_ID') %>%
+  select(-value) %>%
+  sample_frac(1) %>%
+  group_by(Hotplate_ID) %>%
+  mutate(Hotplate_Pos = rep_len(c(1:4), n())) %>%
+  group_by(Hotplate_ID, Hotplate_Pos) %>%
+  mutate(Cook_Day = row_number()) %>%
+  arrange(Cook_Day, Hotplate_ID, Hotplate_Pos)
+
+# ipq_cook_labels %>%
+#   write_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/IPQ_Cook_Labels.csv')
+
+ipq_cook_labels %>%
+  mutate(Pericarp_1 = NA,
+        Pericarp_2 = NA,
+        Kernels_1 = NA,
+        Kernels_2 = NA) %>%
+  pivot_longer(cols = c(Pericarp_1, Pericarp_2, Kernels_1, Kernels_2),
+              names_to = 'Subsample') %>%
+  select(-value)# %>%
+  #write_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/IPQ_Cook_Subsamples.csv')
+```
+
+## Validating Kernel Parameters
+### Ash and Protein
+```{r validating ash and protein content, message = FALSE, warning = FALSE}
+ash_pro_data = read_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/Ash_Protein_Validation_Cooks.csv') %>%
+  select(Sample_ID, Hotplate_ID, Normalized_Pericarp_Mass)
+
+ash_pro_data %>%
+  pivot_wider(id_cols = Sample_ID,
+              names_from = Hotplate_ID,
+              values_from = Normalized_Pericarp_Mass) %>%
+  unnest() %>%
+  #select(-`NA`) %>%
+  mutate(A = as.numeric(A),
+         B = as.numeric(B)) %>%
+  filter(!is.na(A),
+         !is.na(B))
+
+ash_pro_data_grouped = ash_pro_data %>%
+  group_by(Sample_ID) %>%
+  summarise(Normalized_Pericarp_Mass = mean(as.numeric(Normalized_Pericarp_Mass), na.rm = T)) %>%
+  filter(!is.nan(Normalized_Pericarp_Mass)) %>%
+  left_join(hilo_samples %>%
+              select(Sample_ID, Ash, Protein),
+            by = 'Sample_ID') %>%
+  mutate(Ash = str_extract(Ash, '[A-Z][a-z]'),
+         Protein = str_extract(Protein, '[A-Z][a-z]'),
+         Normalized_Pericarp_Mass = log(Normalized_Pericarp_Mass))
+```
+
+#### Plot out the distribution of data used for validation
+```{r plot out the distribution of data used for validation, message = FALSE, warning = FALSE}
+ash_val_dist_data = ych_perten_comp_clean %>%
+  mutate(Ash_Val = case_when(Sample_ID %in% ash_pro_data_grouped$Sample_ID & !is.na(ash_pro_data_grouped$Ash) ~ 'Validation',
+                             T ~ 'Remaining'))
+
+ash_dist_plot = ash_val_dist_data %>%
+  ggplot(aes(x = Ash))+
+  geom_density(fill = 'gray')+
+  geom_rug(data = ash_val_dist_data %>%
+             filter(Ash_Val == 'Validation') %>%
+             mutate(group = case_when(Ash > 1.4 ~ 'High',
+                                      Ash < 1.4 ~ 'Low')),
+           mapping = aes(x = Ash, color = group),
+           length = unit(5, 'points'))+
+  scale_color_manual(values = c('High' = 'magenta4', 'Low' = 'forestgreen'))+
+  labs(x = 'Ground Kernel Ash Content',
+       y = 'density')+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'),
+        legend.position = 'bottom')
+
+ash_dist_plot
+
+ggsave('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/Ash_Validation_Distribution.png',
+       ash_dist_plot,
+       width = 7.5,
+       height = 3.5,
+       dpi = 300)
+
+pro_val_dist_data = ych_foss_comp_clean %>%
+  mutate(Pro_Val = case_when(Sample_ID %in% ash_pro_data_grouped$Sample_ID & !is.na(ash_pro_data_grouped$Protein) ~ 'Validation',
+                             T ~ 'Remaining'))
+
+pro_val_dist_data %>%
+  ggplot(aes(x = Protein))+
+  geom_density(fill = 'gray')+
+  geom_rug(data = pro_val_dist_data %>%
+             filter(Pro_Val == 'Validation'),
+           mapping = aes(x = Protein),
+           length = unit(5, 'points'))+
+  labs(x = 'Whole Kernel Protein Content',
+       y = 'density')+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'))
+```
+
+#### Ash Assessment
+```{r}
+ash_plot_scatter = ash_pro_data_grouped %>%
+  filter(!is.na(Ash)) %>%
+  rename(Ash_Group = Ash) %>%
+  left_join(ych_perten %>%
+              select(Sample_ID, Ash),
+            by = 'Sample_ID') %>%
+  arrange(Ash) %>%
+  slice(c(1:20, 44:25)) %>%
+  ggplot(aes(x = Ash, y = Normalized_Pericarp_Mass, color = Ash_Group))+
+  geom_point(show.legend = F)+
+  labs(x = 'Ground Kernel Ash Content',
+       y = 'log(Benchtop Cook Pericarp Retained)')+
+  scale_color_manual(values = c('magenta4', 'forestgreen'))+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'))
+
+ash_val_plot = ggMarginal(ash_plot_scatter,
+                          type = 'density',
+                          groupFill = T,
+                          show.legend = F)
+
+ash_val_plot
+
+ggsave('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/Ash_Validation_Plot.png',
+       ash_val_plot,
+       width = 3.75,
+       height = 3.5,
+       dpi = 300)
+
+ash_grouped_data = ash_pro_data_grouped %>%
+  filter(!is.na(Ash)) %>%
+  pivot_wider(names_from = Ash,
+              values_from = Normalized_Pericarp_Mass) %>%
+  left_join(ych_perten %>%
+              select(Sample_ID, Ash),
+            by = 'Sample_ID') %>%
+  arrange(Ash) %>%
+  slice(c(1:20, 44:25))
+
+t.test(ash_grouped_data$Hi, ash_grouped_data$Lo, var.equal = T)
+
+power.t.test(delta = mean(ash_grouped_data$Hi, na.rm = T) - mean(ash_grouped_data$Lo, na.rm = T),
+             sd = sd(c(ash_grouped_data$Hi, ash_grouped_data$Lo), na.rm = T),
+             sig.level = 0.05,
+             n = 20,
+             type = 'two.sample')
+```
+
+#### Protein Assessment
+```{r}
+pro_plot_scatter = ash_pro_data_grouped %>%
+  filter(!is.na(Protein)) %>%
+  rename(Protein_Group = Protein) %>%
+  left_join(ych_foss_comp %>%
+              select(Sample_ID, Protein),
+            by = 'Sample_ID') %>%
+  mutate(Protein_Group = case_when(Protein_Group == 'Hi' ~ 'High',
+                           Protein_Group == 'Lo' ~ 'Low')) %>%
+  ggplot(aes(x = Protein, y = Normalized_Pericarp_Mass, color = Protein_Group))+
+  geom_point()+
+  labs(x = 'NIR Whole Kernel Protein Content',
+       y = 'log(Pericarp Retained)',
+       color = 'Composition Group')+
+  scale_color_manual(values = c('darkred', 'darkblue'))+
+  theme_classic()+
+  theme(legend.position = 'bottom',
+        text = element_text(size = 10, color = 'black'))
+
+pro_val_plot = ggMarginal(pro_plot_scatter,
+                          type = 'density',
+                          groupFill = T,
+                          show.legend = F)
+
+pro_val_plot
+
+ggsave('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/Protein_Validation_Plot.png',
+       pro_val_plot,
+       width = 3.75,
+       height = 2.75,
+       dpi = 300)
+
+pro_grouped_data = ash_pro_data_grouped %>%
+  filter(!is.na(Protein)) %>%
+  pivot_wider(names_from = Protein,
+              values_from = Normalized_Pericarp_Mass)
+
+t.test(pro_grouped_data$Hi, pro_grouped_data$Lo, var.equal = T)
+
+power.t.test(delta = mean(pro_grouped_data$Hi, na.rm = T) - mean(pro_grouped_data$Lo, na.rm = T),
+             sd = sd(c(pro_grouped_data$Hi, pro_grouped_data$Lo), na.rm = T),
+             sig.level = 0.05,
+             n = 20,
+             type = 'two.sample')
+```
+
+### Initial Pericarp Quantity
+```{r validating IPQ content, message = FALSE, warning = FALSE}
+ipq_data = read_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/Initial_Pericarp_Quantity_Validation.csv') %>%
+  select(Sample_ID, Hotplate_ID, Normalized_Pericarp_Mass)
+
+ipq_data %>%
+  pivot_wider(id_cols = Sample_ID,
+              names_from = Hotplate_ID,
+              values_from = Normalized_Pericarp_Mass) %>%
+  unnest() %>%
+  #select(-`NA`) %>%
+  mutate(A = as.numeric(A),
+         B = as.numeric(B)) %>%
+  filter(!is.na(A),
+         !is.na(B))
+
+ipq_data_grouped = ipq_data %>%
+  group_by(Sample_ID) %>%
+  summarise(Normalized_Pericarp_Mass = mean(as.numeric(Normalized_Pericarp_Mass), na.rm = T)) %>%
+  filter(!is.nan(Normalized_Pericarp_Mass)) %>%
+  left_join(ipq_hilo_samples %>%
+              select(Sample_ID, Normalized_Pericarp_Mass, Group) %>%
+              rename(IPQ = Normalized_Pericarp_Mass),
+            by = 'Sample_ID') %>%
+  mutate(Normalized_Pericarp_Mass = log(Normalized_Pericarp_Mass),
+         IPQ = log(IPQ))
+
+ipq_val_plot = ipq_data_grouped %>%
+  ggplot(aes(x = IPQ, y = Normalized_Pericarp_Mass))+
+  geom_abline(color = 'gray', linetype = 'dashed')+
+  geom_point()+
+  geom_smooth(method = 'lm', se = F, color = 'black')+
+  labs(x = 'Initial Pericarp Quantity',
+       y = 'log(Benchtop Cook Pericarp Retained)')+
+  ggpubr::stat_cor(method = 'pearson', label.sep = '\n')+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'))
+
+ipq_val_plot
+
+ggsave('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/IPQ_Validation_Plot.png',
+       ipq_val_plot,
+       width = 3.75,
+       height = 3.5,
+       dpi = 300)
+
+ipq_grouped_data = ipq_data_grouped %>%
+  pivot_wider(names_from = Group,
+              values_from = Normalized_Pericarp_Mass)
+
+t.test(ipq_grouped_data$High, ipq_grouped_data$Low, var.equal = T)
+
+power.t.test(delta = mean(c(ipq_grouped_data$High, ipq_grouped_data$Low), na.rm = T),
+             sd = sd(c(ipq_grouped_data$High, ipq_grouped_data$Low), na.rm = T),
+             sig.level = 0.05,
+             n = 20,
+             type = 'one.sample')
+```
+
+#### Plot out the distribution of IPQ data used for validation
+```{r plot out the distribution of IPQ data used for validation, message = FALSE, warning = FALSE}
+ipq_val_dist_data = ipq_screen %>%
+  mutate(IPQ_Val = case_when(Sample_ID %in% ipq_data$Sample_ID ~ 'Validation',
+                             T ~ 'Remaining'))
+
+ipq_dist_plot = ipq_val_dist_data %>%
+  ggplot(aes(x = Normalized_Pericarp_Mass))+
+  geom_density(fill = 'gray')+
+  geom_rug(data = ipq_val_dist_data %>%
+             filter(IPQ_Val == 'Validation'),
+           mapping = aes(x = Normalized_Pericarp_Mass),
+           length = unit(5, 'points'))+
+  labs(x = 'Initial Pericarp Quantity',
+       y = 'density')+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'))
+
+ipq_dist_plot
+
+ggsave('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/IPQ_Validation_Distribution.png',
+       ipq_dist_plot,
+       width = 7.5,
+       height = 3,
+       dpi = 300)
+
+```
+
+# Extra Analyses
+## Check the diversity of IPQ Samples against Initial 60
+```{r check spectral diversity of IPQ samples against Initial 60, message = FALSE, warning = FALSE}
+ipq_samples = ipq_screen %>%
+  select(Sample_ID) %>%
+  unique()
+
+init_60 = initial_data %>%
+  select(Sample_ID) %>%
+  unique()
+
+sum(ipq_samples$Sample_ID %in% init_60$Sample_ID)
+
+foss_pca = prcomp(ych_foss_spec_clean[,3:142], center = T, scale. = T)
+
+pca_plot = ych_foss_spec_clean %>%
+  mutate(Group = case_when(Sample_ID %in% ipq_samples$Sample_ID ~ 'Screening Subset',
+                           Sample_ID %in% init_60$Sample_ID ~ 'Initial Subset',
+                           T ~ 'Unselected')) %>%
+  select(Sample_ID, Group) %>%
+  bind_cols(foss_pca$x %>%
+              as_tibble() %>%
+              select(PC1, PC2)) %>%
+  mutate(Group = factor(Group,
+                        levels = c('Unselected', 'Screening Subset', 'Initial Subset'))) %>%
+  arrange(Group) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Group)) +
+  geom_point() +
+  scale_color_manual(values = c('darkgreen', 'darkcyan', 'gray'), breaks = c('Initial Subset', 'Screening Subset', 'Unselected')) +
+  labs(x = paste0('PC1 (', round(summary(foss_pca)[[6]][[2]], 2), '%)'),
+       y = paste0('PC2 (', round(summary(foss_pca)[[6]][[5]], 2), '%)')) +
+  theme_classic() +
+  theme(text = element_text(size = 10, color = 'black'))
+
+pca_plot
+
+ggsave('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/IPQ_Sample_Selection_PCA.png',
+       pca_plot,
+       width = 7.55,
+       height = 5,
+       dpi = 300)
+```
+
+## Create a table of all samples with foss spec and both comps
+```{r create a table of all samples with foss spec and both comps, message = FALSE, warning = FALSE}
+ych_foss_spec_clean %>%
+  mutate(Group = case_when(Sample_ID %in% ipq_samples$Sample_ID ~ 'Screening',
+                           Sample_ID %in% init_60$Sample_ID ~ 'Initial',
+                           T ~ 'Remaining')) %>%
+  left_join(ych_foss_comp_clean,
+            by = c('Sample_ID')) %>%
+  left_join(ych_perten_comp_clean,
+            by = c('Sample_ID', 'Genotype')) %>%
+  select(Sample_ID, Genotype, Group, 144:152, `400`:`1095`, -Density) %>%
+  rename(`Whole Kernel Protein` = Protein.x,
+         `Whole Kernel Starch` = Starch.x,
+         `Whole Kernel Oil` = Oil,
+         `Ground Kernel Protein` = Protein.y,
+         `Ground Kernel Starch` = Starch.y,
+         `Ground Kernel Fiber` = Fiber,
+         `Ground Kernel Fat` = Fat,
+         `Ground Kernel Ash` = Ash) %>%
+  write_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/All_Samples_Foss_Spec_Comp.csv')
+```
+
+## Make Table of Ash and IPQ Validation Samples
+```{r make table of ash and ipq validation samples, message = FALSE, warning = FALSE}
+ash_pro_data_grouped %>%
+  filter(!is.na(Ash)) %>%
+  rename(Ash_Group = Ash) %>%
+  left_join(ych_perten %>%
+              select(Sample_ID, Ash),
+            by = 'Sample_ID') %>%
+  select(Sample_ID, Normalized_Pericarp_Mass, Ash) %>%
+  slice(c(1:20, 44:25)) %>%
+  bind_rows(ipq_data_grouped %>%
+              select(Sample_ID, IPQ, Normalized_Pericarp_Mass)) %>%
+  rename(`Initial Pericarp Quantity` = IPQ) %>%
+  write_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Outputs/Validation_Samples.csv')
+```
+
+## Kernel Shape Analysis
+### Read and format data
+```{r read in and format the screening subset kernel shape data, message = FALSE, warning = FALSE}
+kernel_shape_data = read_csv('~/Desktop/Grad_School/Research/Pericarp/Chemometrics/Data/Screening_Subset_Region_Props.csv') %>%
+  select(Sample_ID, major_axis_length, eccentricity) %>%
+  rename(Kernel_Length = major_axis_length,
+         Circularity = eccentricity) %>%
+  filter(!is.na(Kernel_Length),
+         !is.na(Circularity)) %>%
+  group_by(Sample_ID) %>%
+  summarize(Kernel_Length = mean(Kernel_Length),
+            Circularity = mean(Circularity)) %>%
+  mutate(Group = case_when(Sample_ID %in% str_remove(ipq_data$Sample_ID, ":") ~ 'Validation',
+                           T ~ 'Remaining Subset'))
+```
+
+### Check the spread of the IPQ Samples
+```{r check the spread of the IPQ samples, message = FALSE, warning = FALSE}
+kernel_shape_data_long = kernel_shape_data %>%
+  pivot_longer(cols = c(Kernel_Length, Circularity),
+               names_to = 'Parameter',
+               values_to = 'Value')
+
+kernel_shape_data_long %>%
+  ggplot(aes(x = Value))+
+  geom_density(fill = 'gray')+
+  geom_rug(data = kernel_shape_data_long %>%
+             filter(Group == 'Validation'),
+           mapping = aes(x = Value),
+           length = unit(5, 'points'))+
+  facet_wrap(~Parameter, scales = 'free')+
+  labs(x = 'Kernel Shape Parameter',
+       y = 'Density')+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'),
+        legend.position = 'bottom')
+```
+These are pretty well spread throughout the distriburtion. Lets see if there is a correlation with the pericarp retention data.
+
+### Validate kernel length
+```{r validate kernel length, message = FALSE, warning = FALSE}
+kernel_shape_validation_data = kernel_shape_data %>%
+  left_join(ipq_data_grouped %>%
+              mutate(Sample_ID = str_remove(Sample_ID, ':')) %>%
+              select(Sample_ID, Normalized_Pericarp_Mass),
+            by = 'Sample_ID') %>%
+  filter(Group == 'Validation')
+
+kernel_length_plot = kernel_shape_validation_data %>%
+  ggplot(aes(x = Kernel_Length, y = Normalized_Pericarp_Mass))+
+  geom_point()+
+  geom_smooth(method = 'lm', se = F, color = 'black')+
+  labs(x = 'Kernel Length',
+       y = 'log(Benchtop Cook Pericarp Retained)')+
+  ggpubr::stat_cor(method = 'pearson', label.sep = '\n')+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'))
+
+kernel_length_plot
+```
+Length validated, technically, but it was originally negatively correlated with pericarp retention. Given its relatively high p-value, and switch of association sign, I would not consider this validated.
+
+### Validate kernel circularity
+```{r validate kernel circularity, message = FALSE, warning = FALSE}
+kernel_circularity_plot = kernel_shape_validation_data %>%
+  ggplot(aes(x = Circularity, y = Normalized_Pericarp_Mass))+
+  geom_point()+
+  geom_smooth(method = 'lm', se = F, color = 'black')+
+  labs(x = 'Kernel Circularity',
+       y = 'log(Benchtop Cook Pericarp Retained)')+
+  ggpubr::stat_cor(method = 'pearson', label.sep = '\n')+
+  theme_classic()+
+  theme(text = element_text(size = 10, color = 'black'))
+
+kernel_circularity_plot
+```
+Kernel circularity, even though it was one of the more signficiantly correlated traits, is not associated with pericarp retention in an independent validation set. Circularity is not validated.
