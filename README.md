@@ -1,6 +1,5 @@
 # Pericarp Retention Analysis
-### Michael Burns
-### UMN APS
+### Michael Burns | UMN APS
 
 ## Background
 Purpose: Developing methods for researchers to assess the quantity of pericarp retained after the nixtamalization process.
